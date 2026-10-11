@@ -1,0 +1,209 @@
+'''
+ai algorithm
+searching : minimax
+pruning : alpha-beta pruning
+evaluation : ...
+making candidates
+'''
+from OmokEngine import GameState
+
+SCORE_TABLE = {
+    (4,2): 100000,  # 열린 사
+    (4,1): 10000,   # 닫힌 사
+    (3,2): 1000,    # 열린 삼
+    (3,1): 100,     # 닫힌 삼
+    (2,2): 50,      # 열린 두
+    (2,1): 10,      # 닫힌 두
+}
+
+DIRECTIONS = [(1, 0), (0, 1), (1, 1), (1, -1)]
+
+# 함수의 탐색수를 줄이기 위한 후보수 선정, radius 범위 이내의 좌표를 후보로 정함
+def getCandidateMoves(gs, radius = 2):
+    candidates = []
+    for x in range(len(gs.board)):
+        for y in range(len(gs.board)):
+            if gs.board[x][y] == '-':
+                continue
+            for nx in range(x - radius, x + radius + 1):
+                for ny in range(y - radius, y + radius + 1):
+                    if 0 <= nx < len(gs.board) and 0 <= ny < len(gs.board) and gs.board[nx][ny] == '-':
+                        candidates.append((nx, ny))
+    # 흑차례이면 금수는 고려하지 않음
+    if gs.blackToPlay:
+        for i in range(len(candidates) - 1, -1, -1):
+            if gs.getForbiddenMove(candidates[i]):
+                candidates.pop(i)
+    return list(set(candidates))
+
+'''
+평가함수 (휴리스틱)
+1. 승리하는 경우 INF
+2. 열린4 : 100000
+3. 닫힌4 : 10000
+4. 열린3 : 1000
+5. 닫힌3 : 100
+6. 열린2 : 50
+7. 닫힌2 : 10
+'''
+# 평가함수 현재 보드의 점수를 흑 기준으로 계산함. (음수이면 백이 유리한 상태)
+def evaluate(gs):
+    size = len(gs.board)
+    visited = set()  # (x, y, 방향번호) 단위로 "이미 점수를 매긴 선"을 표시
+    scoreBlack = 0
+    scoreWhite = 0
+
+    for x in range(size):
+        for y in range(size):
+            color = gs.board[x][y]
+            if color not in ('b', 'w'):
+                continue
+            for di, (dx, dy) in enumerate(DIRECTIONS):
+                if (x, y, di) in visited:
+                    continue  # 이미 점수가 매겨진 선에 속한 돌이면 건너뜀
+
+                end1, end2 = findLineEndpoints(gs, x, y, dx, dy, color)
+
+                # 이 선에 속한 모든 돌을 방문 처리 (중복 계산 방지)
+                x1, y1 = end1
+                x2, y2 = end2
+                stepx = 0 if x1 == x2 else (1 if x2 > x1 else -1)
+                stepy = 0 if y1 == y2 else (1 if y2 > y1 else -1)
+                cx, cy = x1, y1
+                while True:
+                    if gs.board[cx][cy] == color:
+                        visited.add((cx, cy, di))
+                    if (cx, cy) == (x2, y2):
+                        break
+                    cx += stepx
+                    cy += stepy
+
+                score = getScore(gs, color, end1, end2)
+
+                if color == 'b':
+                    scoreBlack += score
+                else:
+                    scoreWhite += score
+
+    return scoreBlack - scoreWhite
+
+# 라인의 양 끝 점 좌표를 리턴하는 함수, 빈칸은 1개 허용
+def findLineEndpoints(gs, x, y, dx, dy, color):
+    size = len(gs.board)
+
+    def extend(sign):
+        cx, cy = x, y
+        lastStone = (x, y)
+        gapUsed = False
+        while True:
+            nx, ny = cx + sign * dx, cy + sign * dy
+            if not (0 <= nx < size and 0 <= ny < size):
+                break
+            if gs.board[nx][ny] == color:
+                lastStone = (nx, ny)
+                cx, cy = nx, ny
+            elif gs.board[nx][ny] == '-' and not gapUsed:
+                gapUsed = True
+                cx, cy = nx, ny  # 빈칸 1개는 건너뛰고 계속 탐색
+            else:
+                break  # 상대 돌, 벽, 또는 두 번째 빈칸이면 멈춤
+        return lastStone
+
+    end1 = extend(-1)
+    end2 = extend(1)
+    return end1, end2
+
+# 라인의 문자열을 읽고 점수를 계산하는 함수
+def getScore(gs, color, end1, end2):
+    pattern = ''
+    x1, y1 = end1
+    x2, y2 = end2
+    stepx = 0 if x1 == x2 else (1 if x2 > x1 else -1)
+    stepy = 0 if y1 == y2 else (1 if y2 > y1 else -1)
+    cx, cy = x1, y1
+    while (cx, cy) != (x2, y2):
+        pattern += gs.board[cx][cy]
+        cx += stepx
+        cy += stepy
+    pattern += gs.board[cx][cy] # 마지막 돌 좌표
+
+    # 양 끝 확인
+    if len(pattern) <= 1:
+        return 0
+    print (end1, end2, pattern)
+    score = 0
+    return score
+
+# 간단한 테스트용
+def getTestScore(gs, pos):
+    directions = [(0,1), (1,0), (1,1), (1,-1)]
+    length = 3
+    currentColor = gs.board[pos[0]][pos[1]]
+    score = 0
+    for dx, dy in directions:
+        pattern = gs.getLinePattern(pos[0],pos[1], dx, dy, length)
+        colorCount = 0
+        for i in range(len(pattern)):
+            if pattern[i] == currentColor: # 연속한 돌의 개수
+                colorCount += 1
+            elif pattern[i] == '-':
+                continue
+            else: # 상대 돌 또는 벽인 경우
+                score += 5**colorCount
+                colorCount = 0
+        if colorCount > 0:
+            score += 5**colorCount
+    return score
+
+'''
+흑 입장에서 보드 점수를 계산
+내 차례이면 최대 점수를 선택 (나의 최선 수)
+상대 차례이면 최소 점수를 선택 (상대의 최선 수)
+
+depth : 탐색의 깊이
+alpha : 내가 선택하는 최선의 값 (max)
+beta : 상대가 선택하는 최선의 값 (min)
+만약 alpha >= beta 라면 상대는 이 선택을 하지 않음 -> 탐색하지 않음
+maximizingPlayer
+'''
+def minimax(gs, depth, alpha, beta, maximizingPlayer):
+    # 가장 아래 노드에 도달
+    if depth == 0 or gs.blackWin or gs.whiteWin:
+        return evaluate(gs), None
+
+    candidates = getCandidateMoves(gs)
+    bestPos = ()
+
+    # 후보수 없는 경우
+    if not candidates:
+        return evaluate(gs), None
+
+    if maximizingPlayer:
+        bestScore = -float('inf')
+        for move in candidates:
+            gs.placeStone(move)
+            score, _ = minimax(gs, depth - 1, alpha, beta, False)
+            gs.undoMove()
+            bestPos = move if score >= bestScore else bestPos
+            alpha = max(alpha, score)
+            bestScore = max(bestScore, score)
+            if alpha >= beta:
+                break
+        return bestScore, bestPos
+    else:
+        bestScore = float('inf')
+        for move in candidates:
+            gs.placeStone(move)
+            score, _ = minimax(gs, depth - 1, alpha, beta, True)
+            gs.undoMove()
+            bestPos = move if score <= bestScore else bestPos
+            beta = min(beta, score)
+            bestScore = min(bestScore, score)
+            if alpha >= beta:
+                break
+        return bestScore, bestPos
+
+# ai는 백돌을 둔다
+def aiMove(gs):
+    score, pos = minimax(gs, 2, -float('inf'), float('inf'), False)
+    return pos
