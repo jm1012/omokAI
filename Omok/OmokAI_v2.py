@@ -160,7 +160,7 @@ def getSimpleScore(counts):
 '''
 # 평가함수. 현재 보드의 점수를 흑 기준으로 계산
 # 모든 줄을 문자열로 읽음 -> 패턴 추출 -> SCORE_TABLE 으로 점수 부여
-def evaluate(gs):
+def evaluateOld(gs):
     board = gs.board
     counts = {'b' : [0] * 8, 'w' : [0] * 8 } # 패턴의 개수를 저장하는 딕셔너리
     for line in LINES:
@@ -174,6 +174,18 @@ def evaluate(gs):
             total = counts[color]
             for i in range(8):
                 total[i] += count[i]
+    return scoreFromCounts(counts['b'], True) - scoreFromCounts(counts['w'], False)
+
+# 평가함수. 보드 전체가 아닌 착수점을 기준으로 계산
+# 착수이후 점수의 변화만 계산하면 됨
+def evaluate(gs, pos):
+    board = gs.board
+    counts = {'b' : [0] * 8, 'w' : [0] * 8 }
+    for idxLine, idxPos in POS_LINES.get(pos, []):
+        charsAfter = ''.join(board[x][y] for x, y in LINES[idxPos])
+        charsBefore = charsAfter[:idxPos] + '-' + charsAfter[idxPos+1:] # 착수하기 전 라인 상태
+        counts['b'] = countLinePatterns(charsAfter, 'b') - countLinePatterns(charsBefore, 'b')
+        counts['w'] = countLinePatterns(charsAfter, 'w') - countLinePatterns(charsBefore, 'w')
     return scoreFromCounts(counts['b'], True) - scoreFromCounts(counts['w'], False)
 
 # 패턴 개수를 점수로 변환하는 함수
