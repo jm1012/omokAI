@@ -31,10 +31,7 @@ def main():
     while running:
         # computer's turn
         if not gs.blackToPlay and not debugMode:
-            pos = ai2.aiMove(gs)  # calculating the move
-            if not pos: # 빈 튜플 방어
-                break
-            gs.placeStone(pos)
+            computerMove(gs, ai2)
             continue
         # user's turn
         for event in pg.event.get():
@@ -69,6 +66,14 @@ def main():
             gs.saveMoveLog() # 로그 저장
             running = False
         drawGameState(screen, gs)
+
+# 오목 봇 버전을 선택 (성능 비교 용)
+def computerMove(gs, botVersion):
+    pos = botVersion.aiMove(gs)
+    if not pos:  # 빈 튜플 방어
+        return False
+    gs.placeStone(pos)
+    return True
 
 def drawGameState(screen, gs):
     drawBoard(screen)

@@ -351,6 +351,8 @@ def minimax(gs, depth, alpha, beta, maximizingPlayer):
 
 # ai는 백돌을 둔다
 def aiMove(gs):
+    if len(gs.moveLog) == 0: # 첫 수는 중앙
+        return 7, 7
     score, pos = minimax(gs, AI_DEPTH, -float('inf'), float('inf'), False)
     print("AI 착수:", pos, "평가 점수:", score)  # 디버그용 출력
     return pos

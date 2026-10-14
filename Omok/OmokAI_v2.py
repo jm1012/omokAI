@@ -1,9 +1,11 @@
 '''
-ai algorithm
-searching : minimax
+ai algorithm v2 (Opus.5.5: 0단계 - 문제점 개선)
+searching : negamax
 pruning : alpha-beta pruning
-evaluation : ...
-making candidates
+evaluation(heuristic) : 돌의 패턴에 따른 점수 부여
+making candidates : 미리 단순 계산으로 상위 12개 후보를 선정함. 강제수가 있다면 그 수만 탐색하도록 하여 탐색 범위를 줄임
+
+
 '''
 from OmokEngine import GameState
 
@@ -17,6 +19,12 @@ SCORE_TABLE = {
 }
 
 WIN_SCORE = 1000000 # 승리점수
+
+# 공간 점수 가중치
+# 상대가 4칸 간격으로 막으면 오목을 완성할 수 없는 공간이 됨. 오목 봇이 이 위협을 인지하도록 하기 위함.
+# 5목을 완성할 수 있는 공간에 있는 돌의 개수마다 이 점수를 부여함. 상대가 4칸 띄워 막으면 이 점수가 없어지므로 위협으로 인지함.
+POTENTIAL_WEIGHT = 40
+
 DIRECTIONS = [(1, 0), (0, 1), (1, 1), (1, -1)]
 BOARD_SIZE = 15
 MAX_CANDIDATES = 12 # 탐색할 후보수의 최대 개수
@@ -116,7 +124,9 @@ def getCandidateMoves(gs, radius = 2):
         if oppAfter[0] > 0:
             oppWins.append(pos)
         # 강제수 (상대가 사목을 만들 수 있는 경우 (삼목), 흑의 금수는 제외)
-        if oppAfter[1] > 0 and not (oppColor == 'b' and gs.getForbiddenMove(pos)):
+        # Opus.5.5: 수정 'oppAfter[1] > 0' -> 'oppAfter[1] > oppBefore[1]'
+        # 이 자리에 두었을 때 열린4가 "새로 생기는지"를 봐야 함 (이미 있던 열린4까지 세면 잘못된 강제수가 됨)
+        if oppAfter[1] > oppBefore[1] and not (oppColor == 'b' and gs.getForbiddenMove(pos)):
             oppOpenFour = True
         # 후보수 정렬 (착수점 기준 점수 부여, 사를 만드는 수, 공격을 막는 수)
         isMakingFour = meAfter[1] + meAfter[2] > meBefore[1] + meBefore[2]
@@ -146,7 +156,8 @@ def getSimpleScore(counts):
     return (counts[0] * WIN_SCORE
             + counts[1] * SCORE_TABLE[(4,2)] + counts[2] * SCORE_TABLE[(4,1)]
             + counts[3] * SCORE_TABLE[(3,2)] + counts[4] * SCORE_TABLE[(3,1)]
-            + counts[5] * SCORE_TABLE[(2,2)] + counts[6] * SCORE_TABLE[(2,1)])
+            + counts[5] * SCORE_TABLE[(2,2)] + counts[6] * SCORE_TABLE[(2,1)]
+            + counts[7])  # Opus.5.5: 공간 점수는 가중치 없이(1배) 사용. '+ POTENTIAL_WEIGHT' 는 오타로 보이지만, '* POTENTIAL_WEIGHT' 로 고치면 수 정렬이 공간 위주가 되어 오히려 약해짐 (원본과 8판: 2승 6패 -> 1배로 두면 3승 2패 3무)
 
 '''
 평가함수 (휴리스틱)
@@ -160,7 +171,7 @@ def getSimpleScore(counts):
 '''
 # 평가함수. 현재 보드의 점수를 흑 기준으로 계산
 # 모든 줄을 문자열로 읽음 -> 패턴 추출 -> SCORE_TABLE 으로 점수 부여
-def evaluateOld(gs):
+def evaluate(gs):
     board = gs.board
     counts = {'b' : [0] * 8, 'w' : [0] * 8 } # 패턴의 개수를 저장하는 딕셔너리
     for line in LINES:
@@ -176,30 +187,21 @@ def evaluateOld(gs):
                 total[i] += count[i]
     return scoreFromCounts(counts['b'], True) - scoreFromCounts(counts['w'], False)
 
-# 평가함수. 보드 전체가 아닌 착수점을 기준으로 계산
-# 착수이후 점수의 변화만 계산하면 됨
-def evaluate(gs, pos):
-    board = gs.board
-    counts = {'b' : [0] * 8, 'w' : [0] * 8 }
-    for idxLine, idxPos in POS_LINES.get(pos, []):
-        charsAfter = ''.join(board[x][y] for x, y in LINES[idxPos])
-        charsBefore = charsAfter[:idxPos] + '-' + charsAfter[idxPos+1:] # 착수하기 전 라인 상태
-        counts['b'] = countLinePatterns(charsAfter, 'b') - countLinePatterns(charsBefore, 'b')
-        counts['w'] = countLinePatterns(charsAfter, 'w') - countLinePatterns(charsBefore, 'w')
-    return scoreFromCounts(counts['b'], True) - scoreFromCounts(counts['w'], False)
-
 # 패턴 개수를 점수로 변환하는 함수
-# counts : [5목, 열린4, 닫힌4, 열린3, 닫힌3, 열린2, 닫힌2, -]
+# counts : [5목, 열린4, 닫힌4, 열린3, 닫힌3, 열린2, 닫힌2, 공간점수]
 def scoreFromCounts(counts, isBlack):
-    five, open4, closed4, open3, closed3, open2, closed2, _ = counts
+    five, open4, closed4, open3, closed3, open2, closed2, potential = counts
     if five > 0: # 승리
         return WIN_SCORE
     # 점수 계산
     score = (open4 * SCORE_TABLE[(4,2)] + closed4 * SCORE_TABLE[(4,1)]
              + open3 * SCORE_TABLE[(3,2)] + closed3 * SCORE_TABLE[(3,1)]
-             + open2 * SCORE_TABLE[(2,2)] + closed2 * SCORE_TABLE[(2,1)])
+             + open2 * SCORE_TABLE[(2,2)] + closed2 * SCORE_TABLE[(2,1)]
+             + potential * POTENTIAL_WEIGHT)
     # 강한 공격 (4,3 이나 4,4 처럼 막을 수 없는 수)
-    if open4 >= 1 and open3 >= 1: # 4,3 은 열린4 점수를 부여함
+    # Opus.5.5: 버그 수정 open4 -> closed4. 열린4는 이미 막을 수 없는 수라서 4-3 판정은 닫힌4 + 열린3 이어야 함
+    # (기존 코드는 열린4가 있을 때만 보너스를 줘서, 정작 닫힌4 + 열린3 (4-3) 을 알아보지 못했음)
+    if closed4 >= 1 and open3 >= 1: # 4,3 은 열린4 점수를 부여함
         score += SCORE_TABLE[(4,2)]
     if closed4 >= 2 and isBlack == False: # 백의 4,4 는 열린4 점수를 부여함
         score += SCORE_TABLE[(4,2)]
@@ -294,32 +296,41 @@ def countLinePatterns(line, color):
     twos = notInside(twos, bigThrees)
     open2 = notInside(open2, bigThrees)
 
+    # 공간점수
+    potential = 0
+    for i in range(1, n-5):
+        window = chars[i:i+5]
+        if '#' in window:
+            continue
+        if isBlack and (chars[i-1] == 'x' or chars[i+5] == 'x'): # 흑 장목
+            continue
+        potential += window.count('x')
+
     result = (five,
               len(open4), len(fours-open4),
               len(open3), len(threes-open3),
               len(open2), len(twos-open2),
-              0)
+              potential)
     LINE_CACHE[key] = result
     return result
 
 '''
-흑 입장에서 보드 점수를 계산
-내 차례이면 최대 점수를 선택 (나의 최선 수)
-상대 차례이면 최소 점수를 선택 (상대의 최선 수)
+Opus.5.5: 설명 수정 (minimax 설명이 남아 있었음)
+negamax : 점수를 항상 "지금 둘 차례인 쪽" 기준으로 계산함 (양수 = 차례인 쪽이 유리)
+자식 노드의 점수는 상대 기준이므로 부호를 뒤집어서 사용 -> 모든 노드에서 최댓값만 고름
 
-depth : 탐색의 깊이
-alpha : 내가 선택하는 최선의 값 (max)
-beta : 상대가 선택하는 최선의 값 (min)
-만약 alpha >= beta 라면 상대는 이 선택을 하지 않음 -> 탐색하지 않음
-maximizingPlayer
+depth : 남은 탐색 깊이
+alpha : 지금 차례인 쪽이 이미 확보한 최선의 점수 (하한)
+beta  : 상대가 허용하는 최대 점수 (상한). alpha >= beta 이면 상대는 이 수순을 피하므로 더 볼 필요 없음
+자식에게 넘길 때는 기준이 상대로 바뀌므로 창을 (-beta, -alpha) 로 뒤집어서 넘김
 '''
 def negamax(gs, depth, alpha, beta):
-    # Opus.5.5: 승부가 난 노드 = 직전에 상대가 5목을 만든 상태 -> 지금 차례인 쪽은 항상 진 것
+    # 승부가 난 노드 = 직전에 상대가 5목을 만든 상태 -> 지금 차례인 쪽은 항상 진 것
     # depth 가 많이 남아 있을수록(= 더 빨리 졌을수록) 더 나쁜 점수 -> 빠른 승리 / 늦은 패배를 선호
     if gs.blackWin or gs.whiteWin:
         return -(WIN_SCORE + depth), None
 
-    # Opus.5.5: 평가함수는 흑 기준이므로 백 차례이면 부호를 뒤집음
+    # 평가함수는 흑 기준이므로 백 차례이면 부호를 뒤집음
     if depth == 0:
         score = evaluate(gs)
         return (score if gs.blackToPlay else -score), None
@@ -336,7 +347,7 @@ def negamax(gs, depth, alpha, beta):
         if not gs.placeStone(move):
             continue
         score, _ = negamax(gs, depth - 1, -beta, -alpha)
-        score = -score  # Opus.5.5: 상대 기준 점수 -> 내 기준 점수
+        score = -score  # 상대 기준 점수 -> 내 기준 점수
         gs.undoMove()
         # 같은 점수면 먼저 본 수를 유지 (가지치기로 잘린 수는 점수가 경계값이므로)
         if not bestPos or score > bestScore:
@@ -349,6 +360,9 @@ def negamax(gs, depth, alpha, beta):
 
 # ai는 백돌을 둔다
 def aiMove(gs):
+    if len(gs.moveLog) == 0: # 첫 수는 중앙
+        return 7, 7
     score, pos = negamax(gs, AI_DEPTH, -float('inf'), float('inf'))
-    print("AI 착수:", pos, "평가 점수:", score)  # 디버그용 출력
+    blackScore = score if gs.blackToPlay else -score
+    print("AI 착수:", pos, "평가 점수:", blackScore)  # 디버그용 출력
     return pos
