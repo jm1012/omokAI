@@ -4,10 +4,11 @@ searching : negamax
 pruning : alpha-beta pruning
 evaluation(heuristic) : 돌의 패턴에 따른 점수 부여
 making candidates : 미리 단순 계산으로 상위 12개 후보를 선정함. 강제수가 있다면 그 수만 탐색하도록 하여 탐색 범위를 줄임
-
+iterative deepening : 시간 제한까지 depth = 1,2,3,... 순차적으로 탐색. 마지막 결과를 사용.
 
 '''
 from OmokEngine import GameState
+import time
 
 SCORE_TABLE = {
     (4,2): 100000,  # 열린 사
@@ -28,7 +29,14 @@ POTENTIAL_WEIGHT = 40
 DIRECTIONS = [(1, 0), (0, 1), (1, 1), (1, -1)]
 BOARD_SIZE = 15
 MAX_CANDIDATES = 12 # 탐색할 후보수의 최대 개수
-AI_DEPTH = 5 # 탐색의 최대 깊이
+TIME_LIMIT = 2.0 # 한 수당 주어지는 탐색 시간
+MAX_DEPTH = 12 # 탐색 최대 깊이
+
+# 탐색 시간 관리용 전역 변수
+class SearchTimeout(Exception): # 시간이 다 되면 즉시 탐색 종료 시키기 위한 예외
+    pass
+searchDeadline = float('inf') # 이 시각이 지나면 탐색 중단
+nodeCount = 0                 # 탐색한 노드 수
 
 # 보드의 모든 줄(가로, 세로, 대각선 2개)의 좌표 목록을 미리 만들어 둠
 # 길이가 5 미만인 대각선은 5목이 나올 수 없으므로 제외 (게산할 필요 없음)
@@ -325,6 +333,12 @@ beta  : 상대가 허용하는 최대 점수 (상한). alpha >= beta 이면 상�
 자식에게 넘길 때는 기준이 상대로 바뀌므로 창을 (-beta, -alpha) 로 뒤집어서 넘김
 '''
 def negamax(gs, depth, alpha, beta):
+    # 32 노드 마다 시간 확인
+    global nodeCount
+    nodeCount += 1
+    if nodeCount % 32 == 0 and time.time() > searchDeadline:
+        raise SearchTimeout
+
     # 승부가 난 노드 = 직전에 상대가 5목을 만든 상태 -> 지금 차례인 쪽은 항상 진 것
     # depth 가 많이 남아 있을수록(= 더 빨리 졌을수록) 더 나쁜 점수 -> 빠른 승리 / 늦은 패배를 선호
     if gs.blackWin or gs.whiteWin:
@@ -346,9 +360,12 @@ def negamax(gs, depth, alpha, beta):
         # 착수에 실패하면(금수 등) undoMove 가 직전 수를 지우지 않도록 건너뜀
         if not gs.placeStone(move):
             continue
-        score, _ = negamax(gs, depth - 1, -beta, -alpha)
+        # 탐색 도중 시간초과 시 이미 착수한 돌은 반드시 (undo)되돌려야함
+        try:
+            score, _ = negamax(gs, depth - 1, -beta, -alpha)
+        finally:
+            gs.undoMove()
         score = -score  # 상대 기준 점수 -> 내 기준 점수
-        gs.undoMove()
         # 같은 점수면 먼저 본 수를 유지 (가지치기로 잘린 수는 점수가 경계값이므로)
         if not bestPos or score > bestScore:
             bestScore = score
@@ -358,11 +375,64 @@ def negamax(gs, depth, alpha, beta):
             break
     return bestScore, bestPos
 
+# 루트탐색
+# 이전 탐색의 최선 수 먼저 탐색
+def searchRoot(gs, depth, candidates, firstMove):
+    # 이전 탐색의 최선 수를 후보수의 가장 앞에 배치함
+    if firstMove in candidates:
+        candidates = [firstMove] + [m for m in candidates if m != firstMove]
+    alpha, beta = -float('inf'), float('inf')
+    bestScore = -float('inf')
+    bestPos = ()
+    for move in candidates:
+        if not gs.placeStone(move):
+            continue
+        try:
+            score, _ = negamax(gs, depth - 1, -beta, -alpha)
+        finally:
+            gs.undoMove()
+        score = -score
+        if not bestPos or score > bestScore:
+            bestScore = score
+            bestPos = move
+        alpha = max(alpha, score)
+    return bestScore, bestPos
+
 # ai는 백돌을 둔다
 def aiMove(gs):
-    if len(gs.moveLog) == 0: # 첫 수는 중앙
+    # 첫 수는 중앙
+    if len(gs.moveLog) == 0:
         return 7, 7
-    score, pos = negamax(gs, AI_DEPTH, -float('inf'), float('inf'))
-    blackScore = score if gs.blackToPlay else -score
-    print("AI 착수:", pos, "평가 점수:", blackScore)  # 디버그용 출력
-    return pos
+
+    # iterative deepening
+    global nodeCount, searchDeadline
+    nodeCount = 0
+    startTime = time.time()
+    candidates = getCandidateMoves(gs)
+
+    if not candidates:
+        return ()
+    if len(candidates) == 1: # 강제수가 하나이면 탐색하지 않아도 됨
+        print("AI 착수:", candidates[0], "(강제수)")
+        return candidates[0]
+
+    bestScore, bestPos, reachedDepth = 0, candidates[0], 0
+    for depth in range(1, MAX_DEPTH + 1):
+        searchDeadline = float('inf') if depth == 1 else startTime + TIME_LIMIT # 시작시각+제한시간
+        try:
+            score, pos = searchRoot(gs, depth, candidates, bestPos)
+        except SearchTimeout: # 탐색 중간에 타임아웃 시 결과를 버림
+            break
+        if pos:
+            bestScore, bestPos, reachedDepth = score, pos, depth
+        # 이기거나 지는 수순 발견 시 더 이상 탐색하지 않음
+        if abs(bestScore) >= WIN_SCORE:
+            break
+        # 다음 탐색을 시간 내에 못 끝낼 가능성이 매우 높으므로 탐색을 미리 중단함
+        if time.time() - startTime > TIME_LIMIT / 2:
+            break
+
+    blackScore = bestScore if gs.blackToPlay else -bestScore
+    print("AI 착수:", bestPos, "평가 점수:", blackScore,
+          "깊이:", reachedDepth, "노드:", nodeCount, "시간: %.2f초" % (time.time() - startTime))  # 디버그용 출력
+    return bestPos

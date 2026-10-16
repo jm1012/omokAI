@@ -5,6 +5,7 @@ import pygame as pg
 import OmokEngine
 import OmokAI as ai
 import OmokAI_v2 as ai2
+import OmokAI_v2_2_zobrist as ai3
 
 WIDTH = HEIGHT = 600
 DIMENSION = 15
