@@ -5,7 +5,6 @@ import pygame as pg
 import OmokEngine
 import OmokAI as ai
 import OmokAI_v2 as ai2
-import OmokAI_v2_2_zobrist as ai3
 
 WIDTH = HEIGHT = 600
 DIMENSION = 15
@@ -66,6 +65,7 @@ def main():
             print(winner + " win!")
             gs.saveMoveLog() # 로그 저장
             running = False
+        # draw board
         drawGameState(screen, gs)
 
 # 오목 봇 버전을 선택 (성능 비교 용)

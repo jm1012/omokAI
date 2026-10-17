@@ -1,14 +1,16 @@
 '''
-ai algorithm v2 (Opus.5.5: 0단계 - 문제점 개선)
+ai algorithm v2 + (반복 심화 + Zobrist hash + 증분평가)
 searching : negamax
 pruning : alpha-beta pruning
 evaluation(heuristic) : 돌의 패턴에 따른 점수 부여
 making candidates : 미리 단순 계산으로 상위 12개 후보를 선정함. 강제수가 있다면 그 수만 탐색하도록 하여 탐색 범위를 줄임
 iterative deepening : 시간 제한까지 depth = 1,2,3,... 순차적으로 탐색. 마지막 결과를 사용.
-
+zobrist hash : 앞서 탐색한 국면의 해시를 저장하고 같은 국면이 나오면 그 값을 사용함.
+incremental evaluation : 착수점을 포함하는 4 방향의 선만 계산하여 평가점수를 갱신함.
 '''
 from OmokEngine import GameState
-import time
+import time # 반복 심화 시간제한
+import random # Zobrist 해시
 
 SCORE_TABLE = {
     (4,2): 100000,  # 열린 사
@@ -37,6 +39,57 @@ class SearchTimeout(Exception): # 시간이 다 되면 즉시 탐색 종료 시�
     pass
 searchDeadline = float('inf') # 이 시각이 지나면 탐색 중단
 nodeCount = 0                 # 탐색한 노드 수
+
+'''
+Zobrist hash
+(칸, 색깔) 마다 64bit 랜덤 숫자를 부여 15x15x2 = 450 가지
+국면의 해시 = 놓인 돌의 숫자를 전부 xor 한 값, 백 차례이면 Zobrist_side 도 xor
+돌을 놓을 때 그 숫자만 xor 하면 됨. 무를 때도 동일
+착수 순서에 관련 없이 같은 배치면 같은 해시
+'''
+_rng = random.Random(20261012) # 디버깅 쉽게 하기 위해 시드 고정
+ZOBRIST = {(x,y):{'b':_rng.getrandbits(64), 'w':_rng.getrandbits(64) }
+           for x in range(BOARD_SIZE)
+           for y in range(BOARD_SIZE)}
+ZOBRIST_SIDE = _rng.getrandbits(64) # 차례정보
+
+# 현재 보드의 해시를 처음부터 계산
+def computeHash(gs):
+    h = 0
+    for x in range(BOARD_SIZE):
+        for y in range(BOARD_SIZE):
+            if gs.board[x][y] in ('b', 'w'):
+                h ^= ZOBRIST[(x,y)][gs.board[x][y]]
+    if not gs.blackToPlay:
+        h ^= ZOBRIST_SIDE
+    return h
+
+# 돌을 하나 둔 다음 해시 계산
+def nextHash(h, pos, color):
+    return h ^ ZOBRIST[(pos[0], pos[1])][color] ^ ZOBRIST_SIDE
+
+'''
+전치표 (transposition table)
+TT[해시] = (탐색깊이, 점수, 점수종류, 최선수)
+점수 종류 : alpha-beta 로 잘린 노드의 점수는 정확한 값이 아니라 정확히 구분
+EXACT : 정확한 값 (alpha < 점수 < beta)
+LOWER : 하한, 실제 점수 >= 저장된 점수 (beta 이상이라 잘림)
+UPPER : 상한, 실제 점수 <= 저장된 점수 (alpha를 넘는 수가 없음)
+CANDIDATE_CACHE[해시] = 후보수 목록 : 후보수 선정은 오직 국면에 의해 결정됨, 같은 국면이면 계산할 필요 없음
+(반복 심화에서 큰 효과를 기대할 수 있음)
+'''
+EXACT, LOWER, UPPER = 0, 1, 2
+TT = {}
+CANDIDATE_CACHE = {}
+TT_MAX_SIZE = 500000 # 표가 커지면 메모리가 커지므로 이 값을 초과하면 표를 비움
+ttHits = 0 # (디버그용) hit 횟수
+
+def getCandidatesCached(gs, h):
+    cands = CANDIDATE_CACHE.get(h)
+    if cands is None:
+        cands = getCandidateMoves(gs)
+        CANDIDATE_CACHE[h] = cands
+    return cands
 
 # 보드의 모든 줄(가로, 세로, 대각선 2개)의 좌표 목록을 미리 만들어 둠
 # 길이가 5 미만인 대각선은 5목이 나올 수 없으므로 제외 (게산할 필요 없음)
@@ -76,9 +129,10 @@ def analyzeMove(board, pos, color, oppColor):
     meBefore, meAfter = [0] * 8, [0] * 8
     oppBefore, oppAfter = [0] * 8, [0] * 8
     oppBlocked = [0] * 8
-    for idxLine, idxPos in POS_LINES.get(pos, []):
+    for idxLine, idxPos in POS_LINES.get(pos, []): # pos 키가 없으면 빈 리스트를 반환
         # 라인 문자열을 만들고 pos 에 흑돌, 백돌을 두었을 때 라인을 만듦
-        chars = ''.join(board[x][y] for x, y in LINES[idxLine])
+        # 증분상태가 있다면 저장된 문자열을 그대로 사용
+        chars = incLineStrs[idxLine] if incActive else ''.join(board[x][y] for x, y in LINES[idxLine])
         myLine = chars[:idxPos] + color + chars[idxPos + 1:]
         oppLine = chars[:idxPos] + oppColor + chars[idxPos + 1:]
         for total, counts in ((meBefore, countLinePatterns(chars, color)),
@@ -194,6 +248,96 @@ def evaluate(gs):
             for i in range(8):
                 total[i] += count[i]
     return scoreFromCounts(counts['b'], True) - scoreFromCounts(counts['w'], False)
+
+'''
+증분평가
+돌을 둘 때 착수점을 포함한 4방향의 줄만 변화하므로 해당 줄만 계산함.
+다른 줄의 정보는 저장해 둠
+incLineStrs[줄 번호]   : 그 줄의 현재 문자열
+incLineCounts[줄 번호] : 그 줄의 현재 패턴 개수
+incTotals             : 모든 줄의 패턴 개수 합계 (평가점수 계산용)
+incStack              : 착수하기 전 값을 저장 (무를때 필요)
+탐색중 makeMove / unmakeMove 를 함께 사용해야 점수가 정상 유지됨
+INC_DEBUG = True 이면 증분평가와 evaluate 를 함께 실행해서 값을 비교함 (디버그용)
+'''
+INC_DEBUG = False
+incActive = False
+incLineStrs = []
+incLineCounts = []
+incTotals = {'b': [0]*8, 'w': [0]*8 }
+incStack = []
+
+# 현재 보드에서 증분상태를 새로 계산 (aiMove 실행시 한번 실행)
+def incInit(gs):
+    global incActive, incLineStrs, incLineCounts, incTotals, incStack
+    incLineStrs = [''.join(gs.board[x][y] for x,y in line) for line in LINES]
+    incLineCounts = []
+    incTotals = {'b': [0]*8, 'w': [0]*8 }
+    for chars in incLineStrs:
+        counts = {color: countLinePatterns(chars, color) for color in ('b', 'w')}
+        incLineCounts.append(counts)
+        for i in range(8):
+            incTotals['b'][i] += counts['b'][i]
+            incTotals['w'][i] += counts['w'][i]
+    incStack = []
+    incActive = True
+
+# pos 에 color 돌을 두었을 때 지나는 줄만 갱신
+def incPlace(pos, color):
+    saved = []
+    for idxLine, idxPos in POS_LINES.get(pos, []):
+        # 착수 이전 문자열과 패턴 개수
+        strBefore = incLineStrs[idxLine]
+        cntBefore = incLineCounts[idxLine]
+        # 착수 이후 문자열과 패턴 개수
+        strAfter = strBefore[:idxPos] + color + strBefore[idxPos+1:]
+        cntAfter = {c:countLinePatterns(strAfter, c) for c in ('b', 'w')}
+        # 전체 패턴 개수를 갱신
+        for c in ('b', 'w'):
+            total, before, after = incTotals[c], cntBefore[c], cntAfter[c] # 딕셔너리를 매번 찾기 않기 위함 (매우 작은 차이)
+            for i in range(8):
+                total[i] += -before[i] + after[i]
+        # 업데이트
+        incLineStrs[idxLine] = strAfter
+        incLineCounts[idxLine] = cntAfter
+        saved.append((idxLine, strBefore, cntBefore)) # 착수전 정보
+    incStack.append(saved)
+
+# 마지막으로 둔 돌을 되돌림
+def incUndo():
+    for idxLine, strBefore, cntBefore in incStack.pop():
+        strAfter = incLineStrs[idxLine]
+        cntAfter = incLineCounts[idxLine]
+        incLineStrs[idxLine] = strBefore
+        incLineCounts[idxLine] = cntBefore
+        for c in ('b', 'w'):
+            total, before, after = incTotals[c], cntBefore[c], cntAfter[c]
+            for i in range(8):
+                total[i] += before[i] - after[i]
+
+# 탐색용 착수 / 무르기 : 보드와 증분 상태를 함께 바꿈
+def makeMove(gs, move):
+    color = 'b' if gs.blackToPlay else 'w'
+    if not gs.placeStone(move): # 착수 불가능
+        return False
+    if incActive:
+        incPlace(move, color)
+    return True
+
+def unmakeMove(gs):
+    gs.undoMove()
+    if incActive:
+        incUndo()
+
+# 증분 상태로 점수 계산
+def evaluateInc(gs):
+    if not incActive:
+        return evaluate(gs)
+    score = scoreFromCounts(incTotals['b'], True) - scoreFromCounts(incTotals['w'], False)
+    if INC_DEBUG:
+        full = evaluate(gs)
+        assert score == full, ("증분 평가 불일치", score, full)
+    return score
 
 # 패턴 개수를 점수로 변환하는 함수
 # counts : [5목, 열린4, 닫힌4, 열린3, 닫힌3, 열린2, 닫힌2, 공간점수]
@@ -331,8 +475,9 @@ depth : 남은 탐색 깊이
 alpha : 지금 차례인 쪽이 이미 확보한 최선의 점수 (하한)
 beta  : 상대가 허용하는 최대 점수 (상한). alpha >= beta 이면 상대는 이 수순을 피하므로 더 볼 필요 없음
 자식에게 넘길 때는 기준이 상대로 바뀌므로 창을 (-beta, -alpha) 로 뒤집어서 넘김
+hash : 해시값, None 이면 새로 계산함
 '''
-def negamax(gs, depth, alpha, beta):
+def negamax(gs, depth, alpha, beta, hash = None):
     # 32 노드 마다 시간 확인
     global nodeCount
     nodeCount += 1
@@ -344,27 +489,54 @@ def negamax(gs, depth, alpha, beta):
     if gs.blackWin or gs.whiteWin:
         return -(WIN_SCORE + depth), None
 
+    # 전치표 확인
+    global ttHits
+    if hash is None: # 새로 계산
+        hash = computeHash(gs)
+    alphaOrig = alpha
+    ttMove = None
+    entry = TT.get(hash) # 깊이, 점수, 타입, 최선수
+    if entry is not None:
+        eDepth, eScore, eFlag, eMove = entry
+        ttMove = eMove # (깊이가 부족해서 점수를 사용하지 못해도) 최선수는 먼저 탐색할 수로 사용
+        if eDepth >= depth: # 해시의 탐색 깊이가 현재 깊이보다 깊은 경우에만 해시를 사용
+            if eFlag == EXACT: # 정확한 값
+                ttHits += 1
+                return eScore, eMove
+            if eFlag == LOWER: # 하한, update alpha
+                alpha = max(alpha, eScore)
+            else: # 상한, update beta
+                beta = min(beta, eScore)
+            if alpha >= beta: # 저장된 경계값만으로 잘라내기 가능
+                ttHits += 1
+                return eScore, eMove
+
     # 평가함수는 흑 기준이므로 백 차례이면 부호를 뒤집음
     if depth == 0:
-        score = evaluate(gs)
+        score = evaluateInc(gs) # v2_3_incremental : evaluate -> evaluateInc (전체 대신 증분 계산)
         return (score if gs.blackToPlay else -score), None
 
-    candidates = getCandidateMoves(gs)
+    candidates = getCandidatesCached(gs, hash) # 같은 국면이면 후보수를 다시 계산하지 않음
     if not candidates:
-        score = evaluate(gs)
+        score = evaluateInc(gs) # v2_3_incremental : evaluate -> evaluateInc
         return (score if gs.blackToPlay else -score), None
 
+    # 전치표에 저장된 최선수를 가장 먼저 탐색함 (가지치기 강화)
+    if ttMove in candidates and candidates[0] != ttMove:
+        candidates = [ttMove] + [m for m in candidates if m != ttMove]
+
+    color = 'b' if gs.blackToPlay else 'w' # hash 갱신용
     bestScore = -float('inf')
     bestPos = ()
     for move in candidates:
         # 착수에 실패하면(금수 등) undoMove 가 직전 수를 지우지 않도록 건너뜀
-        if not gs.placeStone(move):
+        if not makeMove(gs, move): # v2_3_incremental : placeStone -> makeMove
             continue
         # 탐색 도중 시간초과 시 이미 착수한 돌은 반드시 (undo)되돌려야함
         try:
-            score, _ = negamax(gs, depth - 1, -beta, -alpha)
+            score, _ = negamax(gs, depth - 1, -beta, -alpha, nextHash(hash, move, color))
         finally:
-            gs.undoMove()
+            unmakeMove(gs) # v2_3_incremental : undoMove -> unmakeMove
         score = -score  # 상대 기준 점수 -> 내 기준 점수
         # 같은 점수면 먼저 본 수를 유지 (가지치기로 잘린 수는 점수가 경계값이므로)
         if not bestPos or score > bestScore:
@@ -373,24 +545,36 @@ def negamax(gs, depth, alpha, beta):
         alpha = max(alpha, score)
         if alpha >= beta:
             break
+
+    # 결과를 전치표에 저장
+    if bestPos:
+        if bestScore <= alphaOrig: # alpha 보다 큰 수가 없었음, 실제 점수는 이것 이하
+            flag = UPPER
+        elif bestScore >= beta: # beta 이상이라 잘림, 실제 점수는 이것 이상
+            flag = LOWER
+        else:
+            flag = EXACT
+        TT[hash] = (depth, bestScore, flag, bestPos)
+
     return bestScore, bestPos
 
 # 루트탐색
 # 이전 탐색의 최선 수 먼저 탐색
-def searchRoot(gs, depth, candidates, firstMove):
+def searchRoot(gs, depth, candidates, firstMove, hash):
     # 이전 탐색의 최선 수를 후보수의 가장 앞에 배치함
     if firstMove in candidates:
         candidates = [firstMove] + [m for m in candidates if m != firstMove]
+    color = 'b' if gs.blackToPlay else 'w' # hash
     alpha, beta = -float('inf'), float('inf')
     bestScore = -float('inf')
     bestPos = ()
     for move in candidates:
-        if not gs.placeStone(move):
+        if not makeMove(gs, move): # v2_3_incremental : placeStone->makeMove
             continue
         try:
-            score, _ = negamax(gs, depth - 1, -beta, -alpha)
+            score, _ = negamax(gs, depth - 1, -beta, -alpha, nextHash(hash, move, color))
         finally:
-            gs.undoMove()
+            unmakeMove(gs) # v2_3_incremental : undoMove->unmakeMove
         score = -score
         if not bestPos or score > bestScore:
             bestScore = score
@@ -400,27 +584,37 @@ def searchRoot(gs, depth, candidates, firstMove):
 
 # ai는 백돌을 둔다
 def aiMove(gs):
-    # 첫 수는 중앙
-    if len(gs.moveLog) == 0:
+    if len(gs.moveLog) == 0: # 첫 수는 중앙
         return 7, 7
 
     # iterative deepening
-    global nodeCount, searchDeadline
+    global nodeCount, searchDeadline, ttHits, incActive
     nodeCount = 0
     startTime = time.time()
-    candidates = getCandidateMoves(gs)
+    ttHits = 0
 
+    # 전치표는 다음수에서 재사용, 크기 초과시 초기화
+    if len(TT) > TT_MAX_SIZE:
+        TT.clear()
+    if len(CANDIDATE_CACHE) > TT_MAX_SIZE:
+        CANDIDATE_CACHE.clear()
+    hash = computeHash(gs)
+
+    # 후보수
+    candidates = getCandidateMoves(gs)
     if not candidates:
         return ()
     if len(candidates) == 1: # 강제수가 하나이면 탐색하지 않아도 됨
         print("AI 착수:", candidates[0], "(강제수)")
         return candidates[0]
 
+    # 탐색
+    incInit(gs) # 현재 보드로 증분상태 만들기
     bestScore, bestPos, reachedDepth = 0, candidates[0], 0
     for depth in range(1, MAX_DEPTH + 1):
         searchDeadline = float('inf') if depth == 1 else startTime + TIME_LIMIT # 시작시각+제한시간
         try:
-            score, pos = searchRoot(gs, depth, candidates, bestPos)
+            score, pos = searchRoot(gs, depth, candidates, bestPos, hash)
         except SearchTimeout: # 탐색 중간에 타임아웃 시 결과를 버림
             break
         if pos:
@@ -432,7 +626,11 @@ def aiMove(gs):
         if time.time() - startTime > TIME_LIMIT / 2:
             break
 
+    # 탐색 종료시 증분상태 종료, 탐색 밖에서는 makeMove 없이 보드의 상태가 바뀌므로 상태가 맞지 않게 됨
+    incActive = False
+
     blackScore = bestScore if gs.blackToPlay else -bestScore
     print("AI 착수:", bestPos, "평가 점수:", blackScore,
-          "깊이:", reachedDepth, "노드:", nodeCount, "시간: %.2f초" % (time.time() - startTime))  # 디버그용 출력
+          "깊이:", reachedDepth, "노드:", nodeCount, "전치표 사용:", ttHits,  # Opus.5.5: 전치표 사용 횟수 추가
+          "시간: %.2f초" % (time.time() - startTime))  # 디버그용 출력
     return bestPos
