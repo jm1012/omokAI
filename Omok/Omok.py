@@ -5,6 +5,7 @@ import pygame as pg
 import OmokEngine
 import OmokAI as ai
 import OmokAI_v2 as ai2
+import OmokAI_v3 as ai3
 
 WIDTH = HEIGHT = 600
 DIMENSION = 15
@@ -31,7 +32,7 @@ def main():
     while running:
         # computer's turn
         if not gs.blackToPlay and not debugMode:
-            computerMove(gs, ai2)
+            computerMove(gs, ai3)
             continue
         # user's turn
         for event in pg.event.get():
