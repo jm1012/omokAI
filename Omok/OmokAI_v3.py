@@ -8,6 +8,7 @@ iterative deepening : 시간 제한까지 depth = 1,2,3,... 순차적으로 탐�
 zobrist hash : 앞서 탐색한 국면의 해시를 저장하고 같은 국면이 나오면 그 값을 사용함.
 incremental evaluation : 착수점을 포함하는 4 방향의 선만 계산하여 평가점수를 갱신함.
 VCF : 사를 연속으로 두어 이기는 수순 찾기. 나의 VCF 가 있으면 바로 두고 상대의 VCF 가 있으면 막는 수만 탐색
+리프 VCF : 탐색의 끝 노드 (depth=0) 에서 차례인 쪽의 짧은 VCF 확인해서 수평선효과를 줄임. (의미없는 시간끌기용 사)
 '''
 
 from OmokEngine import GameState
@@ -24,6 +25,7 @@ SCORE_TABLE = {
 }
 
 WIN_SCORE = 1000000 # 승리점수
+WIN_THRESHOLD = WIN_SCORE - 1000 # 리프 VCF 에서 사용할 승리점수. (승리점수 - VCF 수순 길이)가 이 값보다 크면 승리 수순으로 간주
 
 # 공간 점수 가중치
 # 상대가 4칸 간격으로 막으면 오목을 완성할 수 없는 공간이 됨. 오목 봇이 이 위협을 인지하도록 하기 위함.
@@ -188,7 +190,6 @@ def getCandidateMoves(gs, radius = 2):
         if oppAfter[0] > 0:
             oppWins.append(pos)
         # 강제수 (상대가 사목을 만들 수 있는 경우 (삼목), 흑의 금수는 제외)
-        # Opus.5.5: 수정 'oppAfter[1] > 0' -> 'oppAfter[1] > oppBefore[1]'
         # 이 자리에 두었을 때 열린4가 "새로 생기는지"를 봐야 함 (이미 있던 열린4까지 세면 잘못된 강제수가 됨)
         if oppAfter[1] > oppBefore[1] and not (oppColor == 'b' and gs.getForbiddenMove(pos)):
             oppOpenFour = True
@@ -221,7 +222,7 @@ def getSimpleScore(counts):
             + counts[1] * SCORE_TABLE[(4,2)] + counts[2] * SCORE_TABLE[(4,1)]
             + counts[3] * SCORE_TABLE[(3,2)] + counts[4] * SCORE_TABLE[(3,1)]
             + counts[5] * SCORE_TABLE[(2,2)] + counts[6] * SCORE_TABLE[(2,1)]
-            + counts[7])  # Opus.5.5: 공간 점수는 가중치 없이(1배) 사용. '+ POTENTIAL_WEIGHT' 는 오타로 보이지만, '* POTENTIAL_WEIGHT' 로 고치면 수 정렬이 공간 위주가 되어 오히려 약해짐 (원본과 8판: 2승 6패 -> 1배로 두면 3승 2패 3무)
+            + counts[7])  # 공간 점수는 가중치 없이(1배) 사용.
 
 '''
 평가함수 (휴리스틱)
@@ -353,7 +354,7 @@ def scoreFromCounts(counts, isBlack):
              + open2 * SCORE_TABLE[(2,2)] + closed2 * SCORE_TABLE[(2,1)]
              + potential * POTENTIAL_WEIGHT)
     # 강한 공격 (4,3 이나 4,4 처럼 막을 수 없는 수)
-    # Opus.5.5: 버그 수정 open4 -> closed4. 열린4는 이미 막을 수 없는 수라서 4-3 판정은 닫힌4 + 열린3 이어야 함
+    # 버그 수정 open4 -> closed4. 열린4는 이미 막을 수 없는 수라서 4-3 판정은 닫힌4 + 열린3 이어야 함
     # (기존 코드는 열린4가 있을 때만 보너스를 줘서, 정작 닫힌4 + 열린3 (4-3) 을 알아보지 못했음)
     if closed4 >= 1 and open3 >= 1: # 4,3 은 열린4 점수를 부여함
         score += SCORE_TABLE[(4,2)]
@@ -469,7 +470,6 @@ def countLinePatterns(line, color):
     return result
 
 '''
-Opus.5.5: 설명 수정 (minimax 설명이 남아 있었음)
 negamax : 점수를 항상 "지금 둘 차례인 쪽" 기준으로 계산함 (양수 = 차례인 쪽이 유리)
 자식 노드의 점수는 상대 기준이므로 부호를 뒤집어서 사용 -> 모든 노드에서 최댓값만 고름
 
@@ -515,6 +515,12 @@ def negamax(gs, depth, alpha, beta, hash = None):
 
     # 평가함수는 흑 기준이므로 백 차례이면 부호를 뒤집음
     if depth == 0:
+        # 리프 VCF. 사로 시간을 끌어서 승리수순을 탐색범위 밖으로 밀어내는 경우를 없에기 위함
+        if leafHasFourChance(gs):
+            seq = findVCF(gs, hash, VCF_LEAF_DEPTH, VCF_LEAF_LIMIT)
+            if seq:
+                return WIN_SCORE - len(seq), None
+        # 기존 평가함수
         score = evaluateInc(gs) # v2_3_incremental : evaluate -> evaluateInc (전체 대신 증분 계산)
         return (score if gs.blackToPlay else -score), None
 
@@ -736,6 +742,18 @@ def filterByOppVCF(gs, hash, candidates, oppSeq):
             unmakeMove(gs)
     return safe if safe else candidates
 
+# 리프 VCF 탐색 범위
+VCF_LEAF_DEPTH = 4  # 리프에서 탐색할 사의 최대 개수
+VCF_LEAF_LIMIT = 12 # 리프 VCF 한 번의 최대 노드 수
+
+# 리프에서 차례인 쪽의 사를 만들 수 있는지 확인
+# 만들 사가 없다면 VCF 탐색을 건너뜀
+def leafHasFourChance(gs):
+    if not incActive:
+        return True
+    c = incTotals['b' if gs.blackToPlay else 'w']
+    return c[1] + c[2] + c[3] + c[4] > 0
+
 # 루트탐색
 # 이전 탐색의 최선 수 먼저 탐색
 def searchRoot(gs, depth, candidates, firstMove, hash):
@@ -827,7 +845,7 @@ def searchWithTreats(gs, hash, candidates, startTime):
         if pos:
             bestScore, bestPos, reachedDepth = score, pos, depth
         # 이기거나 지는 수순 발견 시 더 이상 탐색하지 않음
-        if abs(bestScore) >= WIN_SCORE:
+        if abs(bestScore) >= WIN_THRESHOLD: # WIN_SCORE -> WIN_THRESHOLD (리프 VCF 에서 발견한 승리 처리)
             break
         # 다음 탐색을 시간 내에 못 끝낼 가능성이 매우 높으므로 탐색을 미리 중단함
         if time.time() - startTime > TIME_LIMIT / 2:
@@ -836,6 +854,6 @@ def searchWithTreats(gs, hash, candidates, startTime):
     # 디버그 출력
     blackScore = bestScore if gs.blackToPlay else -bestScore
     print("AI 착수:", bestPos, "평가 점수:", blackScore,
-          "깊이:", reachedDepth, "노드:", nodeCount, "전치표 사용:", ttHits,  # Opus.5.5: 전치표 사용 횟수 추가
+          "깊이:", reachedDepth, "노드:", nodeCount, "전치표 사용:", ttHits,
           "시간: %.2f초" % (time.time() - startTime))  # 디버그용 출력
     return bestPos
