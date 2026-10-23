@@ -1,0 +1,13 @@
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# PyCharm 설정
+.idea/
+
+# 실행 중 생성되는 파일
+moveLog.txt
+OmokAI_v2_4_1_vcf.py
+OmokAI_v2_4_2_vcfleaf.py
+OmokAI_v2_4_3_vct.py
+tmp.txt
