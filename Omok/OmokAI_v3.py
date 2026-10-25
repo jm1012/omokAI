@@ -10,7 +10,6 @@ incremental evaluation : 착수점을 포함하는 4 방향의 선만 계산하�
 VCF : 사를 연속으로 두어 이기는 수순 찾기. 나의 VCF 가 있으면 바로 두고 상대의 VCF 가 있으면 막는 수만 탐색
 리프 VCF : 탐색의 끝 노드 (depth=0) 에서 차례인 쪽의 짧은 VCF 확인해서 수평선효과를 줄임. (의미없는 시간끌기용 사)
 '''
-
 from OmokEngine import GameState
 import time # 반복 심화 시간제한
 import random # Zobrist 해시
@@ -37,6 +36,7 @@ BOARD_SIZE = 15
 MAX_CANDIDATES = 12 # 탐색할 후보수의 최대 개수
 TIME_LIMIT = 2.0 # 한 수당 주어지는 탐색 시간
 MAX_DEPTH = 12 # 탐색 최대 깊이
+THREAT_TIME_RATIO = 0.3 # VCT 탐색에 사용할 시간 비율
 
 # 탐색 시간 관리용 전역 변수
 class SearchTimeout(Exception): # 시간이 다 되면 즉시 탐색 종료 시키기 위한 예외
@@ -744,7 +744,7 @@ def filterByOppVCF(gs, hash, candidates, oppSeq):
 
 # 리프 VCF 탐색 범위
 VCF_LEAF_DEPTH = 4  # 리프에서 탐색할 사의 최대 개수
-VCF_LEAF_LIMIT = 12 # 리프 VCF 한 번의 최대 노드 수
+VCF_LEAF_LIMIT = 150 # 리프 VCF 한 번의 최대 노드 수
 
 # 리프에서 차례인 쪽의 사를 만들 수 있는지 확인
 # 만들 사가 없다면 VCF 탐색을 건너뜀
@@ -753,6 +753,218 @@ def leafHasFourChance(gs):
         return True
     c = incTotals['b' if gs.blackToPlay else 'w']
     return c[1] + c[2] + c[3] + c[4] > 0
+
+'''
+VCT 탐색 (Victory by Continuous Threats)
+VCF 에 삼을 추가해서 계산함. 삼을 막는 위치가 여러 곳이기 때문에 VCF 보다 비용이 큼
+상대의 모든 방어에 대해 내가 이길 수 있는 지 확인해야 함
+비용이 크기 때문에 탐색 깊이와 노드 제한을 작게 둘 것임
+공격 : 사 (막는 자리 1개), 삼 (다음 수에 열린 사 / 사-사 를 만들 수 있는 자리)
+방어 : 삼을 막는 자리, 사 (역공)
+'''
+VCT_DEPTH = 4          # 공격 측 수(사 또는 삼)의 최대 개수 (사는 응수가 하나라 깊어도 괜찮지만, 삼이 많으면 급격히 느려짐)
+VCT_NODE_LIMIT = 800  # VCT 한 번에 볼 최대 노드 수 (파이썬에서 약 0.5ms/노드)
+VCT_FAIL = {}          # VCT_FAIL[해시] = 실패가 확인된 깊이
+THREE_IDX_CACHE = {}   # (줄 문자열, 색) -> 그 줄에서 열린4 를 만들 수 있게 되는 자리 인덱스
+
+# 삼 자리 찾기, 다음 수에 열린 사가 되면 삼 (위협)
+def threeIndices(s, color):
+    key = (s, color)
+    r = THREE_IDX_CACHE.get(key)
+    if r is None:
+        r = []
+        if s.count(color) >= 2:
+            for i in range(len(s)):
+                if s[i] != '-':
+                    continue
+                t = s[:i] + color + s[i+1:]
+                if any(len(fiveIndices(t[:j] + color + t[j+1:], color)) >= 2
+                       for j in range(len(t)) if t[j] == '-'):
+                    r.append(i)
+        r = tuple(r)
+        THREE_IDX_CACHE[key] = r
+    return r
+
+def findThreeMoves(board, color):
+    result = set()
+    for idxLine, line in enumerate(LINES):
+        for i in threeIndices(getLineStr(board, idxLine), color):
+            result.add(line[i])
+    return sorted(result)
+
+# color 가 지금 두면 이기는 사 (오목 자리 2개 이상 : 열린4, 4-4). 흑은 금수를 제외
+def findWinningFours(gs, color):
+    board = gs.board
+    result = []
+    for m in findFourMoves(board, color):
+        board[m[0]][m[1]] = color      # 잠깐 두어 보고 (fivesThrough 는 보드를 직접 읽음)
+        n = len(fivesThrough(board, m, color))
+        board[m[0]][m[1]] = '-'
+        # 금수 판정은 느리므로 이기는 사인 경우에만 확인
+        if n >= 2 and not (color == 'b' and gs.getForbiddenMove(m)):
+            result.append(m)
+    return result
+
+# 공격 측(att) 의 삼을 막을 수 있는 자리 : 막은 뒤 att 가 이기는 사를 둘 수 없게 되는 자리만 남김
+def findThreeDefenses(gs, att):
+    board = gs.board
+    wins = findWinningFours(gs, att)
+    cand = set(wins)
+    for w in wins: # 열린 사를 만드는 자리 + 그때 생기는 오목 자리 (삼의 양 끝)
+        board[w[0]][w[1]] = att
+        cand |= fivesThrough(board, w , att)
+        board[w[0]][w[1]] = '-'
+    defender = 'w' if att == 'b' else 'b'
+    result = []
+    for d in sorted(cand):
+        if defender == 'b' and gs.getForbiddenMove(d):
+            continue
+        # d를 막은 뒤에도 기존의 이기는 사 중 하나라도 남아 있으면 방어 실패
+        # 방어측 돌이 공격 측의 새로운 사를 만들 수 없으므로 기존 목록만 확인
+        board[d[0]][d[1]] = defender
+        ok = True
+        for w in wins:
+            if w == d:
+                continue
+            board[w[0]][w[1]] = att
+            n = len(fivesThrough(board, w, att))
+            board[w[0]][w[1]] = '-'
+            if n >= 2:
+                ok = False
+                break
+        board[d[0]][d[1]] = '-'
+        if ok:
+            result.append(d)
+    return result
+
+
+# 공격 차례. 이기는 수순을 찾으면 리스트 반환, 없으면 None
+def vctAttack(gs, depth, hash):
+    countTreatNode()
+    me = 'b' if gs.blackToPlay else 'w'
+    opp = 'w' if gs.blackToPlay else 'b'
+    myFives = findFives(gs.board, me)
+    if myFives:
+        return [min(myFives)]
+    if depth < 0:
+        return None
+    # 상대 공격을 막을 수 없으면 탐색x
+    oppFives = findFives(gs.board, opp)
+    if len(oppFives) >= 2:
+        return None
+    # 상대 사를 먼저 막아야함, 막는 수도 위협이어야 공격이 이어짐
+    if oppFives:
+        return vctAfterMove(gs, min(oppFives), depth, hash)
+    if depth == 0 or VCT_FAIL.get(hash, -1) >= depth:
+        return None
+    fours = findFourMoves(gs.board, me)
+    threes = [m for m in findThreeMoves(gs.board, me) if m not in fours]
+    for m in fours + threes:
+        r = vctAfterMove(gs, m , depth, hash)
+        if r:
+            return r
+    VCT_FAIL[hash] = depth
+    return None
+
+# 공격이 m 에 둔 뒤 : 사이면 상대가 막고, 삼이면 상대의 모든 방어 확인
+def vctAfterMove(gs, m, depth, h):
+    me = 'b' if gs.blackToPlay else 'w'
+    opp = 'w' if gs.blackToPlay else 'b'
+    if not makeMove(gs, m):
+        return None
+    try:
+        h1 = nextHash(h, m, me)
+        fives = fivesThrough(gs.board, m, me)
+        if len(fives) >= 2:
+            return [m]
+        if fives: # 사 : 상대는 막을 자리가 하나 뿐임
+            block = min(fives)
+            if not makeMove(gs, block): # 흑이 금수라 못막음
+                return [m, block]
+            try:
+                sub = vctAttack(gs, depth-1, nextHash(h1, block, opp))
+            finally:
+                unmakeMove(gs)
+            return [m, block] + sub if sub else None
+        # 사가 아니면, 다음 수에 이기는 사를 둘 수 있어야 위협임
+        if not findWinningFours(gs, me):
+            return None
+        sub = vctDefend(gs, depth - 1, h1)
+        return [m] + sub if sub else None
+    finally:
+        unmakeMove(gs)
+
+# 방어 측 차례 (공격은 다음수에 이기는 사를 둘 수 있는 상황). 모든 방어 실패시 공격 승리
+def vctDefend(gs, depth, h):
+    countTreatNode()
+    me = 'b' if gs.blackToPlay else 'w'
+    att = 'w' if gs.blackToPlay else 'b'
+    if findFives(gs.board, me): # 방어측이 오목 있음 (공격실패)
+        return None
+    defenses = findThreeDefenses(gs, att) # 막는 자리 후보수
+    for d in findFourMoves(gs.board, me): # 역공 후보수 (사는 무조건 막아야함)
+        if d not in defenses:
+            defenses.append(d)
+    first = None
+    for d in defenses:
+        if not makeMove(gs, d):
+            continue
+        try:
+            r = vctAttack(gs, depth, nextHash(h, d, me))
+        finally:
+            unmakeMove(gs)
+        if not r:
+            return None
+        if first is None:
+            first = [d] + r
+    return first if first else ['(방어 불가)']
+
+def findVCT(gs, h, depth = VCT_DEPTH, limit = VCT_NODE_LIMIT):
+    global vcfNodes, VCF_NODE_LIMIT
+    vcfNodes, saved = 0, VCF_NODE_LIMIT
+    VCF_NODE_LIMIT = limit
+    try:
+        return vctAttack(gs, depth, h)
+    except ThreatBudget:
+        return None
+    finally:
+        VCF_NODE_LIMIT = saved
+
+def findOppVCT(gs, h, depth = VCT_DEPTH, limit = VCT_NODE_LIMIT):
+    gs.blackToPlay = not gs.blackToPlay
+    try:
+        return findVCT(gs, h ^ ZOBRIST_SIDE, depth, limit)
+    finally:
+        gs.blackToPlay = not gs.blackToPlay
+
+# 상대 VCT 를 막는 후보만 남김 (두고 나서 상대에게 VCF, VCT 가 모두 없는 수)
+def filterByOppVCT(gs, h, candidates, oppSeq):
+    me = 'b' if gs.blackToPlay else 'w'
+    opp = 'w' if gs.blackToPlay else 'b'
+    pool = list(candidates)
+    extra = [m for m in oppSeq if isinstance(m, tuple)] + findFourMoves(gs.board, me) + findThreeDefensesFor(gs, opp)
+    for m in extra:
+        if m not in pool and gs.board[m[0]][m[1]] == '-':
+            pool.append(m)
+    safe = []
+    for m in pool:
+        if not makeMove(gs, m):
+            continue
+        try:
+            h1 = nextHash(h, m, me)
+            if gs.blackWin or gs.whiteWin or not (findVCF(gs, h1) or findVCT(gs, h1, VCT_DEPTH, VCT_DEFENSE_LIMIT)):
+                safe.append(m)
+        finally:
+            unmakeMove(gs)
+    return safe if safe else candidates
+
+VCT_DEFENSE_LIMIT = 300  # 방어 확인용 VCT 의 노드 제한 (후보마다 실행하므로 작게)
+
+# 상대(opp)의 삼을 미리 막는 자리 (상대가 지금 열린4 를 만들 수 있으면 그 자리들)
+def findThreeDefensesFor(gs, opp):
+    if not findWinningFours(gs, opp):
+        return []
+    return findThreeDefenses(gs, opp)
 
 # 루트탐색
 # 이전 탐색의 최선 수 먼저 탐색
@@ -834,8 +1046,25 @@ def searchWithTreats(gs, hash, candidates, startTime):
             print("AI 착수:", candidates[0], "(VCF 방어)")
             return candidates[0]
 
-    # 기존 탐색 코드
+    # 내 VCT 탐색 (비용이 크므로 전체 시간제한의 THREAT_TIME_RATIO 비율만큼)
+    searchDeadline = startTime + TIME_LIMIT * THREAT_TIME_RATIO
+    mySeq = findVCT(gs, hash)
+    if mySeq:
+        print("AI 착수:", mySeq[0], "(VCT 승리 수순:", mySeq, ")")
+        return mySeq[0]
+
+    # 상대 VCT 있으면 막는 수만 탐색
+    if not oppSeq:
+        oppSeq = findOppVCT(gs, hash)
+        if oppSeq:
+            candidates = filterByOppVCT(gs, hash, candidates, oppSeq)
+            print("상대 VCT 발견:", oppSeq, "-> 막는 후보:", candidates)
+            if len(candidates) == 1:
+                print("AI 착수:", candidates[0], "(VCT 방어)")
+                return candidates[0]
+    # 기존 반복 심화 탐색 코드
     bestScore, bestPos, reachedDepth = 0, candidates[0], 0
+    idStart = time.time() # 반복심화 탐색 시작한 시각
     for depth in range(1, MAX_DEPTH + 1):
         searchDeadline = float('inf') if depth == 1 else startTime + TIME_LIMIT  # 시작시각+제한시간
         try:
@@ -848,7 +1077,7 @@ def searchWithTreats(gs, hash, candidates, startTime):
         if abs(bestScore) >= WIN_THRESHOLD: # WIN_SCORE -> WIN_THRESHOLD (리프 VCF 에서 발견한 승리 처리)
             break
         # 다음 탐색을 시간 내에 못 끝낼 가능성이 매우 높으므로 탐색을 미리 중단함
-        if time.time() - startTime > TIME_LIMIT / 2:
+        if time.time() - idStart > (startTime + TIME_LIMIT - idStart) / 2:
             break
 
     # 디버그 출력
