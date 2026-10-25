@@ -1,6 +1,6 @@
 /*
- * OmokAI_v2.py 를 JavaScript 로 옮긴 파일
- * ai algorithm v2 + (반복 심화 + Zobrist hash + 증분평가)
+ * OmokAI_v3.py 를 JavaScript 로 옮긴 파일
+ * ai algorithm v3 + (반복 심화 + Zobrist hash + 증분평가)
  * searching : negamax
  * pruning : alpha-beta pruning
  * evaluation(heuristic) : 돌의 패턴에 따른 점수 부여
@@ -8,6 +8,9 @@
  * iterative deepening : 시간 제한까지 depth = 1,2,3,... 순차적으로 탐색. 마지막 결과를 사용.
  * zobrist hash : 앞서 탐색한 국면의 해시를 저장하고 같은 국면이 나오면 그 값을 사용함.
  * incremental evaluation : 착수점을 포함하는 4 방향의 선만 계산하여 평가점수를 갱신함.
+ * VCF : 사를 연속으로 두어 이기는 수순 찾기. 나의 VCF 가 있으면 바로 두고 상대의 VCF 가 있으면 막는 수만 탐색
+ * 리프 VCF : 탐색의 끝 노드 (depth=0) 에서 차례인 쪽의 짧은 VCF 확인해서 수평선효과를 줄임
+ * VCT : 사와 삼을 연속으로 두어 이기는 수순 찾기
  * Web Worker 안에서 실행되면 메시지로 판을 받아 착수점을 돌려줌
  */
 (function (root) {
@@ -23,6 +26,7 @@
   };
 
   const WIN_SCORE = 1000000; // 승리점수
+  const WIN_THRESHOLD = WIN_SCORE - 1000; // 리프 VCF 에서 사용할 승리점수. (승리점수 - VCF 수순 길이)가 이 값보다 크면 승리 수순으로 간주
 
   // 공간 점수 가중치
   // 5목을 완성할 수 있는 공간에 있는 돌의 개수마다 이 점수를 부여함. 상대가 4칸 띄워 막으면 이 점수가 없어지므로 위협으로 인지함.
@@ -33,6 +37,7 @@
   const MAX_CANDIDATES = 12; // 탐색할 후보수의 최대 개수
   const TIME_LIMIT = 2.0;    // 한 수당 주어지는 탐색 시간 (초)
   const MAX_DEPTH = 12;      // 탐색 최대 깊이
+  const THREAT_TIME_RATIO = 0.3; // VCT 탐색에 사용할 시간 비율
 
   // 탐색 시간 관리용 전역 변수
   class SearchTimeout extends Error {} // 시간이 다 되면 즉시 탐색 종료 시키기 위한 예외
@@ -546,6 +551,12 @@
 
     // 평가함수는 흑 기준이므로 백 차례이면 부호를 뒤집음
     if (depth === 0) {
+      // 리프 VCF. 사로 시간을 끌어서 승리수순을 탐색범위 밖으로 밀어내는 경우를 없애기 위함
+      if (leafHasFourChance(gs)) {
+        const seq = findVCF(gs, hash, VCF_LEAF_DEPTH, VCF_LEAF_LIMIT);
+        if (seq) return [WIN_SCORE - seq.length, null];
+      }
+      // 기존 평가함수
       const score = evaluateInc(gs);
       return [gs.blackToPlay ? score : -score, null];
     }
@@ -595,6 +606,443 @@
     return [bestScore, bestPos];
   }
 
+  /*
+   * VCF (Victory by Continuous Fours)
+   * 사를 계속 두어 이기는 수순을 찾는다. 사를 두면 막는 수가 정해져 있기 때문에 더 깊은 탐색을 할 수 있음
+   * 승리 조건
+   * 1. 사를 두었을 때 오목자리가 2개 이상 (상대가 막을 수 없음)
+   * 2. 백의 VCF 에서 막아야할 자리가 금수
+   * 3. 상대의 막는 수 다음에도 VCF 가 이어짐
+   * 상대가 이미 사를 가지고 있으면 그 곳을 막아야하고, 막는 수가 사가 아니면 VCF 가 끊긴다.
+   * 좌표 묶음(set)은 x * 15 + y 정수로 저장함. 정수 순서 = (x, y) 사전순이라 Python 의 min / sorted 와 같음
+   */
+  const VCF_DEPTH = 8;          // 공격측이 둘 수 있는 사의 최대 개수
+  const VCF_NODE_LIMIT = 3000;  // 한번에 볼 최대 노드 수
+  const VCF_FAIL = new Map();   // VCF_FAIL[해시] = 실패가 확인 된 깊이
+  const FIVE_IDX_CACHE = new Map(); // (색, 줄 문자열) -> 오목자리 인덱스
+  const FOUR_IDX_CACHE = new Map(); // (색, 줄 문자열) -> 사를 만드는 자리 인덱스
+  const THREAT_CACHE_MAX = 1000000; // 브라우저 메모리 보호용 (비워도 결과는 같음)
+  let vcfNodes = 0;
+  let vcfNodeLimit = VCF_NODE_LIMIT;
+
+  // VCF / VCT 노드 수 초과시 중단 예외
+  class ThreatBudget extends Error {}
+
+  const toPos = (k) => [Math.floor(k / BOARD_SIZE), k % BOARD_SIZE];
+  const keyOf = (p) => p[0] * BOARD_SIZE + p[1];
+  const sortedPos = (set) => [...set].sort((a, b) => a - b).map(toPos);
+  const minPos = (set) => toPos(Math.min(...set));
+  const xorSide = (h) => [h[0] ^ SIDE_HI, (h[1] ^ SIDE_LO) >>> 0];
+  const cacheSet = (map, key, value) => {
+    if (map.size >= THREAT_CACHE_MAX) map.clear();
+    map.set(key, value);
+  };
+
+  // 줄 문자열
+  function getLineStr(board, idxLine) {
+    return incActive ? incLineStrs[idxLine] : lineString(board, LINES[idxLine]);
+  }
+
+  // 줄 문자열 s에서 color 가 두었을 때 오목이 되는 빈칸의 인덱스
+  function fiveIndices(s, color) {
+    const key = color + s;
+    let r = FIVE_IDX_CACHE.get(key);
+    if (r === undefined) {
+      r = [];
+      if (count(s, color) >= 4) {
+        for (let i = 0; i < s.length; i++) {
+          if (s[i] === '-' && countLinePatterns(s.slice(0, i) + color + s.slice(i + 1), color)[0] > 0) r.push(i);
+        }
+      }
+      cacheSet(FIVE_IDX_CACHE, key, r);
+    }
+    return r;
+  }
+
+  // 줄 문자열 s에서 color 가 두었을 때 사가 되는 빈칸의 인덱스
+  function fourIndices(s, color) {
+    const key = color + s;
+    let r = FOUR_IDX_CACHE.get(key);
+    if (r === undefined) {
+      r = [];
+      if (count(s, color) >= 3) {
+        for (let i = 0; i < s.length; i++) {
+          if (s[i] === '-' && fiveIndices(s.slice(0, i) + color + s.slice(i + 1), color).length) r.push(i);
+        }
+      }
+      cacheSet(FOUR_IDX_CACHE, key, r);
+    }
+    return r;
+  }
+
+  // 보드 전체에서 color 의 오목자리 (좌표 정수 Set)
+  function findFives(board, color) {
+    const result = new Set();
+    LINES.forEach((line, idxLine) => {
+      for (const i of fiveIndices(getLineStr(board, idxLine), color)) result.add(keyOf(line[i]));
+    });
+    return result;
+  }
+
+  // 보드 전체에서 color 의 사목자리 (정렬된 좌표 목록)
+  function findFourMoves(board, color) {
+    const result = new Set();
+    LINES.forEach((line, idxLine) => {
+      for (const i of fourIndices(getLineStr(board, idxLine), color)) result.add(keyOf(line[i]));
+    });
+    return sortedPos(result);
+  }
+
+  // pos 를 지나는 줄에서 color 의 오목 자리 (방금 둔 돌로 생긴 사, 보드에서 직접 계산)
+  function fivesThrough(board, pos, color) {
+    const result = new Set();
+    for (const [idxLine] of POS_LINES[keyOf(pos)]) {
+      const line = LINES[idxLine];
+      for (const i of fiveIndices(lineString(board, line), color)) result.add(keyOf(line[i]));
+    }
+    return result;
+  }
+
+  // 위치 move 에 사를 두었을 때 상대가 막는 과정
+  // 결과 'win' : 상대가 막을 수 없음, null (사 아님 / 착수불가), [막는자리] (상대가 막아야함)
+  function playFour(gs, move, color) {
+    if (!makeMove(gs, move)) return null; // 금수
+    const fives = fivesThrough(gs.board, move, color); // 방금 둔 자리에서 생긴 사
+    if (!fives.size) {
+      unmakeMove(gs);
+      return null;
+    }
+    if (fives.size >= 2) { // 열린 사, 사-사, 막을 수 없음
+      unmakeMove(gs);
+      return 'win';
+    }
+    return minPos(fives); // 착수한 상태로 리턴, 호출한 함수에서 unmakeMove
+  }
+
+  // 노드 초과 또는 시간 초과 제어
+  function countThreatNode() {
+    vcfNodes++;
+    if (vcfNodes > vcfNodeLimit || (vcfNodes % 64 === 0 && now() > searchDeadline)) throw new ThreatBudget();
+  }
+
+  // 지금 차례의 vcf 를 탐색
+  function vcf(gs, depth, hash) {
+    countThreatNode();
+    const me = gs.blackToPlay ? 'b' : 'w';
+    const opp = gs.blackToPlay ? 'w' : 'b';
+    // 내가 이기는 수가 있으면 그 수를 둠
+    const myFives = findFives(gs.board, me);
+    if (myFives.size) return [minPos(myFives)];
+    // 이 국면에서 VCF 가 없음을 이미 확인한 경우 (해시)
+    const key = hashKey(hash);
+    if (depth <= 0 || (VCF_FAIL.get(key) ?? -1) >= depth) return null;
+    // 상대 오목자리가 2개 이상이면 이길 수 없음 (탐색x)
+    const oppFives = findFives(gs.board, opp);
+    if (oppFives.size >= 2) return null;
+    // 상대가 이기는 수가 있으면 막는 경우를 탐색, 아니면 VCF 탐색을 시작함
+    const moves = oppFives.size ? [...oppFives].map(toPos) : findFourMoves(gs.board, me);
+    for (const m of moves) {
+      // m 위치에 착수 -> 상대 착수(강제수) -> 평가
+      const r = playFour(gs, m, me);
+      if (r === null) continue;
+      if (r === 'win') return [m];
+      const block = r;
+      const hash1 = nextHash(hash, m, me);
+      let sub;
+      try {
+        if (!makeMove(gs, block)) return [m, block]; // 흑이 막을 자리가 금수
+        try {
+          sub = vcf(gs, depth - 1, nextHash(hash1, block, opp));
+        } finally {
+          unmakeMove(gs); // 무르기는 반드시 실행
+        }
+      } finally {
+        unmakeMove(gs);
+      }
+      if (sub) return [m, block, ...sub]; // VCF 수순
+    }
+    cacheSet(VCF_FAIL, key, depth);
+    return null;
+  }
+
+  // 노드 수 제한을 두고 VCF 탐색
+  function findVCF(gs, hash, depth = VCF_DEPTH, limit = VCF_NODE_LIMIT) {
+    const saved = vcfNodeLimit;
+    vcfNodes = 0;
+    vcfNodeLimit = limit;
+    try {
+      return vcf(gs, depth, hash);
+    } catch (e) {
+      if (e instanceof ThreatBudget) return null;
+      throw e;
+    } finally {
+      vcfNodeLimit = saved;
+    }
+  }
+
+  // 상대 차례라고 가정하고 상대의 VCF 를 찾음 (내가 한 수 쉬면 상대가 이기는지 = 상대의 위협)
+  function findOppVCF(gs, hash, depth = VCF_DEPTH, limit = VCF_NODE_LIMIT) {
+    gs.blackToPlay = !gs.blackToPlay;
+    try {
+      return findVCF(gs, xorSide(hash), depth, limit);
+    } finally {
+      gs.blackToPlay = !gs.blackToPlay;
+    }
+  }
+
+  // 상대 VCF 를 막는 후보수만 남김
+  // 기존 후보 + 상대 VCF 수순 자리 (공격, 막기) + 나의 사(역공)
+  // 착수 했을 때 상대에게 VCF 가 없는 수만 선택
+  function filterByOppVCF(gs, hash, candidates, oppSeq) {
+    const me = gs.blackToPlay ? 'b' : 'w';
+    const pool = [...candidates];
+    for (const m of [...oppSeq, ...findFourMoves(gs.board, me)]) {
+      if (!hasPos(pool, m) && gs.board[m[0]][m[1]] === '-') pool.push(m);
+    }
+    const safe = [];
+    for (const m of pool) {
+      if (!makeMove(gs, m)) continue;
+      try {
+        if (gs.blackWin || gs.whiteWin || !findVCF(gs, nextHash(hash, m, me))) safe.push(m);
+      } finally {
+        unmakeMove(gs);
+      }
+    }
+    return safe.length ? safe : candidates;
+  }
+
+  // 리프 VCF 탐색 범위
+  const VCF_LEAF_DEPTH = 4;   // 리프에서 탐색할 사의 최대 개수
+  const VCF_LEAF_LIMIT = 150; // 리프 VCF 한 번의 최대 노드 수
+
+  // 리프에서 차례인 쪽의 사를 만들 수 있는지 확인. 만들 사가 없다면 VCF 탐색을 건너뜀
+  function leafHasFourChance(gs) {
+    if (!incActive) return true;
+    const c = incTotals[gs.blackToPlay ? 'b' : 'w'];
+    return c[1] + c[2] + c[3] + c[4] > 0;
+  }
+
+  /*
+   * VCT 탐색 (Victory by Continuous Threats)
+   * VCF 에 삼을 추가해서 계산함. 삼을 막는 위치가 여러 곳이기 때문에 VCF 보다 비용이 큼
+   * 상대의 모든 방어에 대해 내가 이길 수 있는 지 확인해야 함
+   * 공격 : 사 (막는 자리 1개), 삼 (다음 수에 열린 사 / 사-사 를 만들 수 있는 자리)
+   * 방어 : 삼을 막는 자리, 사 (역공)
+   */
+  const VCT_DEPTH = 4;          // 공격 측 수(사 또는 삼)의 최대 개수
+  const VCT_NODE_LIMIT = 800;   // VCT 한 번에 볼 최대 노드 수
+  const VCT_DEFENSE_LIMIT = 300; // 방어 확인용 VCT 의 노드 제한 (후보마다 실행하므로 작게)
+  const VCT_FAIL = new Map();   // VCT_FAIL[해시] = 실패가 확인된 깊이
+  const THREE_IDX_CACHE = new Map(); // (색, 줄 문자열) -> 열린4 를 만들 수 있게 되는 자리 인덱스
+
+  // 삼 자리 찾기, 다음 수에 열린 사가 되면 삼 (위협)
+  function threeIndices(s, color) {
+    const key = color + s;
+    let r = THREE_IDX_CACHE.get(key);
+    if (r === undefined) {
+      r = [];
+      if (count(s, color) >= 2) {
+        for (let i = 0; i < s.length; i++) {
+          if (s[i] !== '-') continue;
+          const t = s.slice(0, i) + color + s.slice(i + 1);
+          for (let j = 0; j < t.length; j++) {
+            if (t[j] === '-' && fiveIndices(t.slice(0, j) + color + t.slice(j + 1), color).length >= 2) {
+              r.push(i);
+              break;
+            }
+          }
+        }
+      }
+      cacheSet(THREE_IDX_CACHE, key, r);
+    }
+    return r;
+  }
+
+  function findThreeMoves(board, color) {
+    const result = new Set();
+    LINES.forEach((line, idxLine) => {
+      for (const i of threeIndices(getLineStr(board, idxLine), color)) result.add(keyOf(line[i]));
+    });
+    return sortedPos(result);
+  }
+
+  // color 가 지금 두면 이기는 사 (오목 자리 2개 이상 : 열린4, 4-4). 흑은 금수를 제외
+  function findWinningFours(gs, color) {
+    const board = gs.board;
+    const result = [];
+    for (const m of findFourMoves(board, color)) {
+      board[m[0]][m[1]] = color; // 잠깐 두어 보고 (fivesThrough 는 보드를 직접 읽음)
+      const n = fivesThrough(board, m, color).size;
+      board[m[0]][m[1]] = '-';
+      // 금수 판정은 느리므로 이기는 사인 경우에만 확인
+      if (n >= 2 && !(color === 'b' && gs.getForbiddenMove(m))) result.push(m);
+    }
+    return result;
+  }
+
+  // 공격 측(att) 의 삼을 막을 수 있는 자리 : 막은 뒤 att 가 이기는 사를 둘 수 없게 되는 자리만 남김
+  function findThreeDefenses(gs, att) {
+    const board = gs.board;
+    const wins = findWinningFours(gs, att);
+    const cand = new Set(wins.map(keyOf));
+    for (const w of wins) { // 열린 사를 만드는 자리 + 그때 생기는 오목 자리 (삼의 양 끝)
+      board[w[0]][w[1]] = att;
+      for (const k of fivesThrough(board, w, att)) cand.add(k);
+      board[w[0]][w[1]] = '-';
+    }
+    const defender = att === 'b' ? 'w' : 'b';
+    const result = [];
+    for (const d of sortedPos(cand)) {
+      if (defender === 'b' && gs.getForbiddenMove(d)) continue;
+      // d를 막은 뒤에도 기존의 이기는 사 중 하나라도 남아 있으면 방어 실패
+      board[d[0]][d[1]] = defender;
+      let ok = true;
+      for (const w of wins) {
+        if (samePos(w, d)) continue;
+        board[w[0]][w[1]] = att;
+        const n = fivesThrough(board, w, att).size;
+        board[w[0]][w[1]] = '-';
+        if (n >= 2) {
+          ok = false;
+          break;
+        }
+      }
+      board[d[0]][d[1]] = '-';
+      if (ok) result.push(d);
+    }
+    return result;
+  }
+
+  // 공격 차례. 이기는 수순을 찾으면 리스트 반환, 없으면 null
+  function vctAttack(gs, depth, hash) {
+    countThreatNode();
+    const me = gs.blackToPlay ? 'b' : 'w';
+    const opp = gs.blackToPlay ? 'w' : 'b';
+    const myFives = findFives(gs.board, me);
+    if (myFives.size) return [minPos(myFives)];
+    if (depth < 0) return null;
+    // 상대 공격을 막을 수 없으면 탐색x
+    const oppFives = findFives(gs.board, opp);
+    if (oppFives.size >= 2) return null;
+    // 상대 사를 먼저 막아야함, 막는 수도 위협이어야 공격이 이어짐
+    if (oppFives.size) return vctAfterMove(gs, minPos(oppFives), depth, hash);
+    const key = hashKey(hash);
+    if (depth === 0 || (VCT_FAIL.get(key) ?? -1) >= depth) return null;
+    const fours = findFourMoves(gs.board, me);
+    const threes = findThreeMoves(gs.board, me).filter(m => !hasPos(fours, m));
+    for (const m of [...fours, ...threes]) {
+      const r = vctAfterMove(gs, m, depth, hash);
+      if (r) return r;
+    }
+    cacheSet(VCT_FAIL, key, depth);
+    return null;
+  }
+
+  // 공격이 m 에 둔 뒤 : 사이면 상대가 막고, 삼이면 상대의 모든 방어 확인
+  function vctAfterMove(gs, m, depth, h) {
+    const me = gs.blackToPlay ? 'b' : 'w';
+    const opp = gs.blackToPlay ? 'w' : 'b';
+    if (!makeMove(gs, m)) return null;
+    try {
+      const h1 = nextHash(h, m, me);
+      const fives = fivesThrough(gs.board, m, me);
+      if (fives.size >= 2) return [m];
+      if (fives.size) { // 사 : 상대는 막을 자리가 하나 뿐임
+        const block = minPos(fives);
+        if (!makeMove(gs, block)) return [m, block]; // 흑이 금수라 못막음
+        let sub;
+        try {
+          sub = vctAttack(gs, depth - 1, nextHash(h1, block, opp));
+        } finally {
+          unmakeMove(gs);
+        }
+        return sub ? [m, block, ...sub] : null;
+      }
+      // 사가 아니면, 다음 수에 이기는 사를 둘 수 있어야 위협임
+      if (!findWinningFours(gs, me).length) return null;
+      const sub = vctDefend(gs, depth - 1, h1);
+      return sub ? [m, ...sub] : null;
+    } finally {
+      unmakeMove(gs);
+    }
+  }
+
+  // 방어 측 차례 (공격은 다음수에 이기는 사를 둘 수 있는 상황). 모든 방어 실패시 공격 승리
+  function vctDefend(gs, depth, h) {
+    countThreatNode();
+    const me = gs.blackToPlay ? 'b' : 'w';
+    const att = gs.blackToPlay ? 'w' : 'b';
+    if (findFives(gs.board, me).size) return null; // 방어측이 오목 있음 (공격실패)
+    const defenses = findThreeDefenses(gs, att); // 막는 자리 후보수
+    for (const d of findFourMoves(gs.board, me)) { // 역공 후보수 (사는 무조건 막아야함)
+      if (!hasPos(defenses, d)) defenses.push(d);
+    }
+    let first = null;
+    for (const d of defenses) {
+      if (!makeMove(gs, d)) continue;
+      let r;
+      try {
+        r = vctAttack(gs, depth, nextHash(h, d, me));
+      } finally {
+        unmakeMove(gs);
+      }
+      if (!r) return null;
+      if (first === null) first = [d, ...r];
+    }
+    return first ? first : ['(방어 불가)'];
+  }
+
+  function findVCT(gs, h, depth = VCT_DEPTH, limit = VCT_NODE_LIMIT) {
+    const saved = vcfNodeLimit;
+    vcfNodes = 0;
+    vcfNodeLimit = limit;
+    try {
+      return vctAttack(gs, depth, h);
+    } catch (e) {
+      if (e instanceof ThreatBudget) return null;
+      throw e;
+    } finally {
+      vcfNodeLimit = saved;
+    }
+  }
+
+  function findOppVCT(gs, h, depth = VCT_DEPTH, limit = VCT_NODE_LIMIT) {
+    gs.blackToPlay = !gs.blackToPlay;
+    try {
+      return findVCT(gs, xorSide(h), depth, limit);
+    } finally {
+      gs.blackToPlay = !gs.blackToPlay;
+    }
+  }
+
+  // 상대(opp)의 삼을 미리 막는 자리 (상대가 지금 열린4 를 만들 수 있으면 그 자리들)
+  function findThreeDefensesFor(gs, opp) {
+    if (!findWinningFours(gs, opp).length) return [];
+    return findThreeDefenses(gs, opp);
+  }
+
+  // 상대 VCT 를 막는 후보만 남김 (두고 나서 상대에게 VCF, VCT 가 모두 없는 수)
+  function filterByOppVCT(gs, h, candidates, oppSeq) {
+    const me = gs.blackToPlay ? 'b' : 'w';
+    const opp = gs.blackToPlay ? 'w' : 'b';
+    const pool = [...candidates];
+    const extra = [...oppSeq.filter(m => Array.isArray(m)), ...findFourMoves(gs.board, me), ...findThreeDefensesFor(gs, opp)];
+    for (const m of extra) {
+      if (!hasPos(pool, m) && gs.board[m[0]][m[1]] === '-') pool.push(m);
+    }
+    const safe = [];
+    for (const m of pool) {
+      if (!makeMove(gs, m)) continue;
+      try {
+        const h1 = nextHash(h, m, me);
+        if (gs.blackWin || gs.whiteWin || !(findVCF(gs, h1) || findVCT(gs, h1, VCT_DEPTH, VCT_DEFENSE_LIMIT))) safe.push(m);
+      } finally {
+        unmakeMove(gs);
+      }
+    }
+    return safe.length ? safe : candidates;
+  }
+
   // 루트탐색: 이전 탐색의 최선 수를 후보수의 가장 앞에 배치함
   function searchRoot(gs, depth, candidates, firstMove, hash) {
     if (hasPos(candidates, firstMove)) {
@@ -623,11 +1071,12 @@
     return [bestScore, bestPos];
   }
 
-  // ai 착수 (반복 심화). opts.timeLimit(초), opts.maxDepth 로 바꿀 수 있음 (테스트용)
+  // ai 착수. opts.timeLimit(초), opts.maxDepth 로 바꿀 수 있음 (테스트용)
+  // 결과의 reason : 'search' (반복 심화), 'forced' (강제수), 'vcf' / 'vct' (승리 수순), 'vcf-defense' / 'vct-defense' (방어)
   function aiMove(gs, opts = {}) {
     const timeLimit = opts.timeLimit ?? TIME_LIMIT;
     const maxDepth = opts.maxDepth ?? MAX_DEPTH;
-    if (gs.moveLog.length === 0) return { pos: [7, 7], score: 0, depth: 0, nodes: 0, forced: true }; // 첫 수는 중앙
+    if (gs.moveLog.length === 0) return { pos: [7, 7], reason: 'forced', score: 0, depth: 0, nodes: 0 }; // 첫 수는 중앙
 
     nodeCount = 0;
     ttHits = 0;
@@ -640,48 +1089,83 @@
 
     // 후보수
     const candidates = getCandidateMoves(gs);
-    if (!candidates.length) return { pos: null, score: 0, depth: 0, nodes: 0 };
+    if (!candidates.length) return { pos: null, reason: 'none', score: 0, depth: 0, nodes: 0 };
     if (candidates.length === 1) { // 강제수가 하나이면 탐색하지 않아도 됨
-      return { pos: candidates[0], score: 0, depth: 0, nodes: 0, forced: true };
+      return { pos: candidates[0], reason: 'forced', score: 0, depth: 0, nodes: 0 };
     }
 
     // 탐색
     incInit(gs); // 현재 보드로 증분상태 만들기
-    let bestScore = 0, bestPos = candidates[0], reachedDepth = 0;
     try {
-      for (let depth = 1; depth <= maxDepth; depth++) {
-        searchDeadline = depth === 1 ? Infinity : startTime + timeLimit * 1000; // 시작시각+제한시간
-        let score, pos;
-        try {
-          [score, pos] = searchRoot(gs, depth, candidates, bestPos, hash);
-        } catch (e) {
-          if (e instanceof SearchTimeout) break; // 탐색 중간에 타임아웃 시 결과를 버림
-          throw e;
-        }
-        if (pos) {
-          bestScore = score;
-          bestPos = pos;
-          reachedDepth = depth;
-        }
-        // 이기거나 지는 수순 발견 시 더 이상 탐색하지 않음
-        if (Math.abs(bestScore) >= WIN_SCORE) break;
-        // 다음 탐색을 시간 내에 못 끝낼 가능성이 매우 높으므로 탐색을 미리 중단함
-        if (now() - startTime > timeLimit * 1000 / 2) break;
-      }
+      return searchWithThreats(gs, hash, candidates, startTime, timeLimit, maxDepth);
     } finally {
       // 탐색 종료시 증분상태 종료
       incActive = false;
     }
+  }
+
+  // aiMove 의 탐색 부분 분리 (코드 가독성)
+  function searchWithThreats(gs, hash, candidates, startTime, timeLimit, maxDepth) {
+    const deadline = startTime + timeLimit * 1000;
+    searchDeadline = deadline;
+
+    // 내 VCF 가 있으면 탐색하지 않고 바로 둠
+    let mySeq = findVCF(gs, hash);
+    if (mySeq) return { pos: mySeq[0], reason: 'vcf', seq: mySeq, score: 0, depth: 0, nodes: nodeCount };
+
+    // 상대 VCF 가 있으면 막는 수만 탐색함
+    let oppSeq = findOppVCF(gs, hash);
+    if (oppSeq) {
+      candidates = filterByOppVCF(gs, hash, candidates, oppSeq);
+      if (candidates.length === 1) return { pos: candidates[0], reason: 'vcf-defense', seq: oppSeq, score: 0, depth: 0, nodes: nodeCount };
+    }
+
+    // 내 VCT 탐색 (비용이 크므로 전체 시간제한의 THREAT_TIME_RATIO 비율만큼)
+    searchDeadline = startTime + timeLimit * 1000 * THREAT_TIME_RATIO;
+    mySeq = findVCT(gs, hash);
+    if (mySeq) return { pos: mySeq[0], reason: 'vct', seq: mySeq, score: 0, depth: 0, nodes: nodeCount };
+
+    // 상대 VCT 있으면 막는 수만 탐색
+    let defended = oppSeq ? 'vcf' : null;
+    if (!oppSeq) {
+      oppSeq = findOppVCT(gs, hash);
+      if (oppSeq) {
+        defended = 'vct';
+        candidates = filterByOppVCT(gs, hash, candidates, oppSeq);
+        if (candidates.length === 1) return { pos: candidates[0], reason: 'vct-defense', seq: oppSeq, score: 0, depth: 0, nodes: nodeCount };
+      }
+    }
+
+    // 기존 반복 심화 탐색 코드
+    let bestScore = 0, bestPos = candidates[0], reachedDepth = 0;
+    const idStart = now(); // 반복심화 탐색 시작한 시각
+    for (let depth = 1; depth <= maxDepth; depth++) {
+      searchDeadline = depth === 1 ? Infinity : deadline; // 시작시각+제한시간
+      let score, pos;
+      try {
+        [score, pos] = searchRoot(gs, depth, candidates, bestPos, hash);
+      } catch (e) {
+        if (e instanceof SearchTimeout) break; // 탐색 중간에 타임아웃 시 결과를 버림
+        throw e;
+      }
+      if (pos) {
+        bestScore = score;
+        bestPos = pos;
+        reachedDepth = depth;
+      }
+      // 이기거나 지는 수순 발견 시 더 이상 탐색하지 않음 (리프 VCF 에서 발견한 승리 포함)
+      if (Math.abs(bestScore) >= WIN_THRESHOLD) break;
+      // 다음 탐색을 시간 내에 못 끝낼 가능성이 매우 높으므로 탐색을 미리 중단함
+      if (now() - idStart > (deadline - idStart) / 2) break;
+    }
 
     const blackScore = gs.blackToPlay ? bestScore : -bestScore;
-    return { pos: bestPos, score: blackScore, depth: reachedDepth, nodes: nodeCount, ttHits };
+    return { pos: bestPos, reason: 'search', defended, score: blackScore, depth: reachedDepth, nodes: nodeCount, ttHits };
   }
 
   // 캐시를 모두 비움 (테스트용)
   function resetCaches() {
-    TT.clear();
-    CANDIDATE_CACHE.clear();
-    LINE_CACHE.clear();
+    for (const m of [TT, CANDIDATE_CACHE, LINE_CACHE, VCF_FAIL, VCT_FAIL, FIVE_IDX_CACHE, FOUR_IDX_CACHE, THREE_IDX_CACHE]) m.clear();
   }
 
   // 판 상태(board, moveLog, blackToPlay)로 GameState 를 다시 만듦
@@ -695,7 +1179,7 @@
 
   root.OmokAI = {
     aiMove, negamax, searchRoot, evaluate, evaluateInc, incInit, getCandidateMoves,
-    countLinePatterns, computeHash, restore, resetCaches, TIME_LIMIT, MAX_DEPTH,
+    countLinePatterns, computeHash, restore, resetCaches, findVCF, findVCT, TIME_LIMIT, MAX_DEPTH,
   };
   if (typeof module !== 'undefined') module.exports = root.OmokAI;
 

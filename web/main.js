@@ -311,7 +311,8 @@
     if (res.id !== myRequest || !thinking) return; // 새 게임/무르기로 취소된 요청
     thinking = false;
     // 반복 심화로 도달한 깊이도 함께 표시 (강제수는 탐색 없이 바로 둠)
-    aiTimeEl.textContent = (res.ms / 1000).toFixed(2) + '초 · ' + (res.forced ? '강제수' : `깊이 ${res.depth}`);
+    const REASONS = { forced: '강제수', vcf: 'VCF 승리 수순', vct: 'VCT 승리 수순', 'vcf-defense': 'VCF 방어', 'vct-defense': 'VCT 방어' };
+    aiTimeEl.textContent = (res.ms / 1000).toFixed(2) + '초 · ' + (REASONS[res.reason] || `깊이 ${res.depth}`);
     if (res.pos) gs.placeStone(res.pos);
     if (!isOver()) setStatus('흑 차례입니다. 교차점을 눌러 돌을 놓으세요.');
     refresh();
