@@ -9,6 +9,7 @@ zobrist hash : 앞서 탐색한 국면의 해시를 저장하고 같은 국면�
 incremental evaluation : 착수점을 포함하는 4 방향의 선만 계산하여 평가점수를 갱신함.
 VCF : 사를 연속으로 두어 이기는 수순 찾기. 나의 VCF 가 있으면 바로 두고 상대의 VCF 가 있으면 막는 수만 탐색
 리프 VCF : 탐색의 끝 노드 (depth=0) 에서 차례인 쪽의 짧은 VCF 확인해서 수평선효과를 줄임. (의미없는 시간끌기용 사)
+VCT : 사와 삼으로 이기는 수순을 찾음. 내 VCT 가 있으면 두고, 상대 VCT 가 있으면 막는 수만 탐색함.
 '''
 from OmokEngine import GameState
 import time # 반복 심화 시간제한
