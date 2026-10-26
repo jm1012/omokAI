@@ -361,6 +361,8 @@ def scoreFromCounts(counts, isBlack):
         score += SCORE_TABLE[(4,2)]
     if closed4 >= 2 and isBlack == False: # 백의 4,4 는 열린4 점수를 부여함
         score += SCORE_TABLE[(4,2)]
+    if open3 >= 2 and isBlack == False: # 백의 3,3 은 거의 이기는 수 이므로 높은 점수를 부여
+        score += SCORE_TABLE[(4,1)]
     return score
 
 
@@ -619,6 +621,10 @@ def fourIndices(s, color):
 def findFives(board, color):
     result = set()
     for idxLine, line in enumerate(LINES):
+        if incActive: # 필터, 패턴 개수를 이미 알고있으면 오목 자리가 있는지 빠르게 판단할 수 있음
+            c = incLineCounts[idxLine][color]
+            if c[0] + c[1] + c[2] == 0:
+                continue
         for i in fiveIndices(getLineStr(board, idxLine), color):
             result.add(line[i])
     return result
@@ -627,6 +633,10 @@ def findFives(board, color):
 def findFourMoves(board, color):
     result = set()
     for idxLine, line in enumerate(LINES):
+        if incActive: # 필터, 패턴 개수를 이미 알고있으면 사목 자리가 있는지 빠르게 판단할 수 있음
+            c = incLineCounts[idxLine][color]
+            if c[1] + c[2] + c[3] + c[4] == 0: # (사, 삼 없음)
+                continue
         for i in fourIndices(getLineStr(board, idxLine), color):
             result.add(line[i])
     return sorted(result)
@@ -764,7 +774,7 @@ VCF 에 삼을 추가해서 계산함. 삼을 막는 위치가 여러 곳이기 
 방어 : 삼을 막는 자리, 사 (역공)
 '''
 VCT_DEPTH = 4          # 공격 측 수(사 또는 삼)의 최대 개수 (사는 응수가 하나라 깊어도 괜찮지만, 삼이 많으면 급격히 느려짐)
-VCT_NODE_LIMIT = 800  # VCT 한 번에 볼 최대 노드 수 (파이썬에서 약 0.5ms/노드)
+VCT_NODE_LIMIT = 3000  # VCT 한 번에 볼 최대 노드 수 (파이썬에서 약 0.5ms/노드)
 VCT_FAIL = {}          # VCT_FAIL[해시] = 실패가 확인된 깊이
 THREE_IDX_CACHE = {}   # (줄 문자열, 색) -> 그 줄에서 열린4 를 만들 수 있게 되는 자리 인덱스
 
@@ -789,6 +799,10 @@ def threeIndices(s, color):
 def findThreeMoves(board, color):
     result = set()
     for idxLine, line in enumerate(LINES):
+        if incActive:  # 필터, 패턴 개수를 이미 알고있으면 사목 자리가 있는지 빠르게 판단할 수 있음
+            c = incLineCounts[idxLine][color]
+            if c[1] + c[2] + c[3] + c[4] + c[5] + c[6] == 0:  # (사, 삼, 이 없음)
+                continue
         for i in threeIndices(getLineStr(board, idxLine), color):
             result.add(line[i])
     return sorted(result)
@@ -925,7 +939,11 @@ def findVCT(gs, h, depth = VCT_DEPTH, limit = VCT_NODE_LIMIT):
     vcfNodes, saved = 0, VCF_NODE_LIMIT
     VCF_NODE_LIMIT = limit
     try:
-        return vctAttack(gs, depth, h)
+        for d in range(1, depth + 1):
+            r = vctAttack(gs, d, h)
+            if r:
+                return r
+        return None
     except ThreatBudget:
         return None
     finally:
@@ -1087,3 +1105,16 @@ def searchWithTreats(gs, hash, candidates, startTime):
           "깊이:", reachedDepth, "노드:", nodeCount, "전치표 사용:", ttHits,
           "시간: %.2f초" % (time.time() - startTime))  # 디버그용 출력
     return bestPos
+
+# 금수판정 캐시
+_origForbidden = GameState.getForbiddenMove # 원래 금수판정 코드
+FORBIDDEN_CACHE = {} # 금수 캐시 key : (좌표, 좌표를 지나는 줄 4개)
+def _cachedForbidden(self, pos):
+    if not incActive: # 증분 상태가 켜져있을때 사용
+        return _origForbidden(self, pos)
+    key = (pos, ) + tuple(incLineStrs[i] for i, _ in POS_LINES.get(pos, []))
+    r = FORBIDDEN_CACHE.get(key)
+    if r is None: # 캐시 hit 실패, 기존 금수판정 코드로 캐시 업데이트
+        r = FORBIDDEN_CACHE[key] = _origForbidden(self, pos)
+    return r
+GameState.getForbiddenMove = _cachedForbidden

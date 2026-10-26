@@ -130,6 +130,8 @@ class GameState():
                     continue
                 if not (j < len(chars)//2 < j+6): # 착수점이 포함되는지 확인
                     continue
+                if not (j < i < j + 5):  # 새로 둔 돌 i 가 열린 사에 포함되어야 함 (이미 열린 사인 줄은 삼이 아님) (열린4-3 판정 오류있었음)
+                    continue
                 # 열린 사가 아닌 경우 확인 (장목이 되는 경우)
                 before_tmp = tmp[j-1] if j-1 >= 0 else '#'
                 after_tmp = tmp[j+6] if j+6 < len(tmp) else '#'
