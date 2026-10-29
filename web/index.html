@@ -153,6 +153,22 @@
     padding: 1px 5px; border: 1px solid var(--line); border-radius: 4px;
   }
 
+  .settings { display: grid; gap: 14px; }
+  .setting { border: 0; margin: 0; padding: 0; min-width: 0; display: grid; gap: 6px; }
+  .setting legend, .setting-label {
+    padding: 0; font-size: 13px; color: var(--muted); letter-spacing: 0.02em;
+    display: flex; justify-content: space-between; width: 100%;
+  }
+  .setting legend { margin-bottom: 6px; }
+  .setting output { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .seg { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg input { position: absolute; opacity: 0; pointer-events: none; }
+  .seg label { text-align: center; padding: 7px 8px; cursor: pointer; font-weight: 500; font-size: 14px; background: var(--bg); }
+  .seg label + input + label { border-left: 1px solid var(--line); }
+  .seg input:checked + label { background: var(--accent); color: var(--accent-fg); }
+  .seg input:focus-visible + label { outline: 2px solid var(--accent); outline-offset: -2px; }
+  input[type="range"] { width: 100%; accent-color: var(--accent); margin: 0; }
+  .range-ends { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
   .toggle { display: flex; align-items: center; gap: 8px; font-size: 14px; cursor: pointer; }
   .toggle input { accent-color: var(--accent); width: 16px; height: 16px; }
 
@@ -186,7 +202,7 @@
 <div class="wrap">
   <header>
     <h1>오목 AI 대국</h1>
-    <p class="sub">흑을 잡고 AI(백)와 둡니다. 렌주 규칙이라 흑은 삼삼, 사사, 장목을 둘 수 없어요.</p>
+    <p class="sub">AI가 둘 돌 색과 한 수당 생각 시간을 골라 대국합니다. 렌주 규칙이라 흑은 삼삼, 사사, 장목을 둘 수 없어요.</p>
   </header>
 
   <div class="game">
@@ -202,6 +218,23 @@
         <dt>마지막 수</dt><dd id="last-move">없음</dd>
         <dt>AI 계산</dt><dd id="ai-time">-</dd>
       </dl>
+
+      <div class="settings">
+        <fieldset class="setting">
+          <legend>AI 돌</legend>
+          <div class="seg">
+            <input type="radio" id="bot-black" name="bot-color" value="b">
+            <label for="bot-black">흑 (AI 먼저)</label>
+            <input type="radio" id="bot-white" name="bot-color" value="w" checked>
+            <label for="bot-white">백 (내가 먼저)</label>
+          </div>
+        </fieldset>
+        <div class="setting">
+          <label class="setting-label" for="think-time">AI 생각 시간 <output id="think-time-value" for="think-time">3초</output></label>
+          <input type="range" id="think-time" min="1" max="10" step="1" value="3">
+          <div class="range-ends"><span>1초</span><span>10초</span></div>
+        </div>
+      </div>
 
       <div class="buttons">
         <button type="button" id="undo">무르기 <kbd>Z</kbd></button>
@@ -220,7 +253,7 @@
         <p class="empty-log">아직 둔 수가 없습니다.</p>
       </div>
 
-      <p class="rules"><strong>AI는 어떻게 두나요?</strong> 돌 주변 후보 중 위협이 큰 12곳을 골라, 먼저 사를 연달아 두어 이기는 수순(VCF)과 사와 삼으로 이기는 수순(VCT)을 찾고, 상대에게 그런 수순이 있으면 막는 수만 봅니다. 그다음 2초 동안 1수, 2수, 3수 앞으로 점점 깊게 내다봅니다(반복 심화 네가맥스, 알파베타 가지치기, 전치표). 열린 사, 닫힌 사, 열린 삼 같은 패턴과 5목을 만들 수 있는 공간으로 판을 평가합니다. 계산은 이 브라우저 안에서만 이뤄집니다.</p>
+      <p class="rules"><strong>AI는 어떻게 두나요?</strong> 돌 주변 후보 중 위협이 큰 12곳을 골라, 먼저 사를 연달아 두어 이기는 수순(VCF)과 사와 삼으로 이기는 수순(VCT, 증명수 탐색)을 찾고, 상대에게 그런 수순이 있으면 막는 수만 봅니다. 그다음 정한 생각 시간 동안 1수, 2수, 3수 앞으로 점점 깊게 내다봅니다(반복 심화 네가맥스, 알파베타 가지치기, 전치표). 고른 수를 두었을 때 상대에게 필승 수순이 생기면 다음 후보로 바꿉니다. 열린 사, 닫힌 사, 열린 삼 같은 패턴과 5목을 만들 수 있는 공간으로 판을 평가합니다. 계산은 이 브라우저 안에서만 이뤄집니다.</p>
     </aside>
   </div>
 </div>

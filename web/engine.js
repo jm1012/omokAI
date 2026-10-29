@@ -108,6 +108,8 @@
           // "열린 사"이면서, 착수점이 포함인 경우 열린 삼 판정
           if (tmp.slice(j, j + 6) !== '-bbbb-') continue;
           if (!(j < c && c < j + 6)) continue;
+          // 새로 둔 돌 i 가 열린 사에 포함되어야 함 (이미 열린 사인 줄은 삼이 아님)
+          if (!(j < i && i < j + 5)) continue;
           // 열린 사가 아닌 경우 확인 (장목이 되는 경우)
           const beforeTmp = j - 1 >= 0 ? tmp[j - 1] : '#';
           const afterTmp = j + 6 < tmp.length ? tmp[j + 6] : '#';

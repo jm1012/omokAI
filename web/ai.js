@@ -1,6 +1,6 @@
 /*
- * OmokAI_v3.py 를 JavaScript 로 옮긴 파일
- * ai algorithm v3 + (반복 심화 + Zobrist hash + 증분평가)
+ * OmokAI_v4_pns2.py 를 JavaScript 로 옮긴 파일
+ * ai algorithm v4 + (반복 심화 + Zobrist hash + 증분평가 + 패턴 테이블)
  * searching : negamax
  * pruning : alpha-beta pruning
  * evaluation(heuristic) : 돌의 패턴에 따른 점수 부여
@@ -10,11 +10,16 @@
  * incremental evaluation : 착수점을 포함하는 4 방향의 선만 계산하여 평가점수를 갱신함.
  * VCF : 사를 연속으로 두어 이기는 수순 찾기. 나의 VCF 가 있으면 바로 두고 상대의 VCF 가 있으면 막는 수만 탐색
  * 리프 VCF : 탐색의 끝 노드 (depth=0) 에서 차례인 쪽의 짧은 VCF 확인해서 수평선효과를 줄임
- * VCT : 사와 삼을 연속으로 두어 이기는 수순 찾기
+ * VCT : 사와 삼으로 이기는 수순을 찾음. 내 VCT 가 있으면 두고, 상대 VCT 가 있으면 막는 수만 탐색함.
+ * pattern table : pos 에 color 을 두었을 때 생기는 패턴의 변화를 저장해두고 사용함. (pattern-table.js)
+ * PNS VCT : VCT 를 증명수 탐색으로 찾음 + 고른 수를 두면 상대에게 VCF/VCT 가 생기는지 확인 (안전 확인) + 칸 코드 갱신 속도 개선
  * Web Worker 안에서 실행되면 메시지로 판을 받아 착수점을 돌려줌
  */
 (function (root) {
   const { GameState, count } = root.OmokEngine;
+  const pt = root.PatternTable; // 패턴 테이블
+  let PT_CODES = null; // 칸별 방향 코드
+  const USE_PT = true;
 
   const SCORE_TABLE = {
     open4: 100000,  // 열린 사
@@ -35,9 +40,10 @@
   const DIRECTIONS = [[1, 0], [0, 1], [1, 1], [1, -1]];
   const BOARD_SIZE = 15;
   const MAX_CANDIDATES = 12; // 탐색할 후보수의 최대 개수
-  const TIME_LIMIT = 2.0;    // 한 수당 주어지는 탐색 시간 (초)
+  const TIME_LIMIT = 3.0;    // 한 수당 주어지는 탐색 시간 (초)
   const MAX_DEPTH = 12;      // 탐색 최대 깊이
   const THREAT_TIME_RATIO = 0.3; // VCT 탐색에 사용할 시간 비율
+  const VERIFY_TIME_RATIO = 0.25; // 전체 시간 중 안전 확인에 남겨 둘 비율 (반복 심화는 나머지 시간만 씀)
 
   // 탐색 시간 관리용 전역 변수
   class SearchTimeout extends Error {} // 시간이 다 되면 즉시 탐색 종료 시키기 위한 예외
@@ -221,7 +227,29 @@
     let oppOpenFour = false; // 상대가 다음수에 열린사를 만들수 있는지 여부
     let scored = [];
 
+    const T = pt.TABLE[color];
     for (const pos of candidates) {
+      if (USE_PT && incActive) { // 패턴 테이블로 변화량만 계산
+        const me = new Array(8).fill(0), opp = new Array(8).fill(0), loss = new Array(8).fill(0);
+        const base = (pos[0] * BOARD_SIZE + pos[1]) * 4;
+        for (let d = 0; d < 4; d++) {
+          const code = PT_CODES[base + d];
+          let e = T.get(code);
+          if (e === undefined) e = pt.lookup(code, color);
+          const [a, b, c] = e;
+          for (let i = 0; i < 8; i++) {
+            me[i] += a[i]; opp[i] += b[i]; loss[i] += c[i];
+          }
+        }
+        if (me[0] > 0) myWins.push(pos);
+        if (opp[0] > 0) oppWins.push(pos);
+        if (opp[1] > 0 && !(oppColor === 'b' && gs.getForbiddenMove(pos))) oppOpenFour = true;
+        const isMakingFour = me[1] + me[2] > 0;
+        const isBlocking = loss[3] < 0 || loss[2] < 0 || loss[1] < 0;
+        const score = getSimpleScore(me) + getSimpleScore(opp);
+        scored.push([score, pos, isMakingFour, isBlocking]);
+        continue;
+      }
       const [meBefore, meAfter, oppBefore, oppAfter, oppBlocked] = analyzeMove(gs.board, pos, color, oppColor);
       // 강제수 (오목을 완성하는 경우)
       if (meAfter[0] > 0) myWins.push(pos);
@@ -302,6 +330,7 @@
       addCounts(incTotals.w, counts.w);
     }
     incStack = [];
+    PT_CODES = pt.initCodes(gs.board); // 칸별 방향 코드 만들기
     incActive = true;
   }
 
@@ -340,15 +369,52 @@
     }
   }
 
+  // 칸 코드 갱신을 빠르게 (pt.updateCodes 와 결과는 같음)
+  // 칸마다 "바뀌는 코드 위치, 흑 xor 값" 목록을 미리 만들어 두고 xor 만 함 (백 xor 값 = 흑 xor 값 * 2)
+  const UPDATE_IDX = [];
+  const UPDATE_VAL = [];
+  for (let x = 0; x < BOARD_SIZE; x++) {
+    for (let y = 0; y < BOARD_SIZE; y++) {
+      const ids = [], vals = [];
+      DIRECTIONS.forEach(([dx, dy], d) => {
+        for (let k = -pt.RADIUS; k <= pt.RADIUS; k++) {
+          if (k === 0) continue;
+          const nx = x - dx * k, ny = y - dy * k;
+          if (0 <= nx && nx < BOARD_SIZE && 0 <= ny && ny < BOARD_SIZE) {
+            const slot = k < 0 ? k + pt.RADIUS : k + pt.RADIUS - 1; // 오프셋 -> 비트 위치(0~13)
+            ids.push(pt.idx(nx, ny, d));
+            vals.push(1 << (2 * slot));
+          }
+        }
+      });
+      UPDATE_IDX.push(Int32Array.from(ids));
+      UPDATE_VAL.push(Int32Array.from(vals));
+    }
+  }
+
+  function updateCodesFast(codes, pos, color) {
+    const i = pos[0] * BOARD_SIZE + pos[1];
+    const ids = UPDATE_IDX[i], vals = UPDATE_VAL[i];
+    const sh = color === 'b' ? 0 : 1;
+    for (let j = 0; j < ids.length; j++) codes[ids[j]] ^= vals[j] << sh;
+  }
+
   // 탐색용 착수 / 무르기 : 보드와 증분 상태를 함께 바꿈
   function makeMove(gs, move) {
     const color = gs.blackToPlay ? 'b' : 'w';
     if (!gs.placeStone(move)) return false; // 착수 불가능
-    if (incActive) incPlace(move, color);
+    if (incActive) {
+      incPlace(move, color);
+      updateCodesFast(PT_CODES, move, color); // 주변 칸 코드 갱신
+    }
     return true;
   }
 
   function unmakeMove(gs) {
+    if (incActive) {
+      const [pos, color] = gs.moveLog[gs.moveLog.length - 1]; // 무르기 전에 마지막 수를 읽음
+      updateCodesFast(PT_CODES, pos, color); // xor 이므로 같은 호출로 되돌림
+    }
     gs.undoMove();
     if (incActive) incUndo();
   }
@@ -376,6 +442,7 @@
     // 강한 공격 (4,3 이나 4,4 처럼 막을 수 없는 수)
     if (closed4 >= 1 && open3 >= 1) score += SCORE_TABLE.open4; // 4,3 은 열린4 점수를 부여함
     if (closed4 >= 2 && !isBlack) score += SCORE_TABLE.open4;  // 백의 4,4 는 열린4 점수를 부여함
+    if (open3 >= 2 && !isBlack) score += SCORE_TABLE.closed4;  // 백의 3,3 은 거의 이기는 수 이므로 높은 점수를 부여
     return score;
   }
 
@@ -679,22 +746,30 @@
   function findFives(board, color) {
     const result = new Set();
     LINES.forEach((line, idxLine) => {
+      if (incActive) { // 필터, 패턴 개수를 이미 알고있으면 오목 자리가 있는지 빠르게 판단할 수 있음
+        const c = incLineCounts[idxLine][color];
+        if (c[0] + c[1] + c[2] === 0) return;
+      }
       for (const i of fiveIndices(getLineStr(board, idxLine), color)) result.add(keyOf(line[i]));
     });
     return result;
   }
 
-  // 보드 전체에서 color 의 사목자리 (정렬된 좌표 목록)
-  function findFourMoves(board, color) {
+  // 보드 전체에서 color 의 사목자리 (정렬된 좌표 목록). 원래 함수 (문자열 버전), 표를 못 쓸 때 사용
+  function findFourMovesStr(board, color) {
     const result = new Set();
     LINES.forEach((line, idxLine) => {
+      if (incActive) { // 필터 (사, 삼 없음)
+        const c = incLineCounts[idxLine][color];
+        if (c[1] + c[2] + c[3] + c[4] === 0) return;
+      }
       for (const i of fourIndices(getLineStr(board, idxLine), color)) result.add(keyOf(line[i]));
     });
     return sortedPos(result);
   }
 
-  // pos 를 지나는 줄에서 color 의 오목 자리 (방금 둔 돌로 생긴 사, 보드에서 직접 계산)
-  function fivesThrough(board, pos, color) {
+  // pos 를 지나는 줄에서 color 의 오목 자리 (방금 둔 돌로 생긴 사, 보드에서 직접 계산). 문자열 버전
+  function fivesThroughStr(board, pos, color) {
     const result = new Set();
     for (const [idxLine] of POS_LINES[keyOf(pos)]) {
       const line = LINES[idxLine];
@@ -830,7 +905,7 @@
    * 방어 : 삼을 막는 자리, 사 (역공)
    */
   const VCT_DEPTH = 4;          // 공격 측 수(사 또는 삼)의 최대 개수
-  const VCT_NODE_LIMIT = 800;   // VCT 한 번에 볼 최대 노드 수
+  const VCT_NODE_LIMIT = 3000;  // VCT 한 번에 볼 최대 노드 수
   const VCT_DEFENSE_LIMIT = 300; // 방어 확인용 VCT 의 노드 제한 (후보마다 실행하므로 작게)
   const VCT_FAIL = new Map();   // VCT_FAIL[해시] = 실패가 확인된 깊이
   const THREE_IDX_CACHE = new Map(); // (색, 줄 문자열) -> 열린4 를 만들 수 있게 되는 자리 인덱스
@@ -858,21 +933,25 @@
     return r;
   }
 
-  function findThreeMoves(board, color) {
+  function findThreeMovesStr(board, color) { // 원래 함수 (문자열 버전), 표를 못 쓸 때 사용
     const result = new Set();
     LINES.forEach((line, idxLine) => {
+      if (incActive) { // 필터 (사, 삼, 이 없음)
+        const c = incLineCounts[idxLine][color];
+        if (c[1] + c[2] + c[3] + c[4] + c[5] + c[6] === 0) return;
+      }
       for (const i of threeIndices(getLineStr(board, idxLine), color)) result.add(keyOf(line[i]));
     });
     return sortedPos(result);
   }
 
   // color 가 지금 두면 이기는 사 (오목 자리 2개 이상 : 열린4, 4-4). 흑은 금수를 제외
-  function findWinningFours(gs, color) {
+  function findWinningFoursStr(gs, color) { // 원래 함수 (문자열 버전), 표를 못 쓸 때 사용
     const board = gs.board;
     const result = [];
-    for (const m of findFourMoves(board, color)) {
-      board[m[0]][m[1]] = color; // 잠깐 두어 보고 (fivesThrough 는 보드를 직접 읽음)
-      const n = fivesThrough(board, m, color).size;
+    for (const m of findFourMovesStr(board, color)) {
+      board[m[0]][m[1]] = color; // 잠깐 두어 보고 (fivesThroughStr 는 보드를 직접 읽음)
+      const n = fivesThroughStr(board, m, color).size;
       board[m[0]][m[1]] = '-';
       // 금수 판정은 느리므로 이기는 사인 경우에만 확인
       if (n >= 2 && !(color === 'b' && gs.getForbiddenMove(m))) result.push(m);
@@ -881,13 +960,13 @@
   }
 
   // 공격 측(att) 의 삼을 막을 수 있는 자리 : 막은 뒤 att 가 이기는 사를 둘 수 없게 되는 자리만 남김
-  function findThreeDefenses(gs, att) {
+  function findThreeDefensesStr(gs, att) { // 원래 함수 (문자열 버전), 표를 못 쓸 때 사용
     const board = gs.board;
-    const wins = findWinningFours(gs, att);
+    const wins = findWinningFoursStr(gs, att);
     const cand = new Set(wins.map(keyOf));
     for (const w of wins) { // 열린 사를 만드는 자리 + 그때 생기는 오목 자리 (삼의 양 끝)
       board[w[0]][w[1]] = att;
-      for (const k of fivesThrough(board, w, att)) cand.add(k);
+      for (const k of fivesThroughStr(board, w, att)) cand.add(k);
       board[w[0]][w[1]] = '-';
     }
     const defender = att === 'b' ? 'w' : 'b';
@@ -900,7 +979,7 @@
       for (const w of wins) {
         if (samePos(w, d)) continue;
         board[w[0]][w[1]] = att;
-        const n = fivesThrough(board, w, att).size;
+        const n = fivesThroughStr(board, w, att).size;
         board[w[0]][w[1]] = '-';
         if (n >= 2) {
           ok = false;
@@ -908,6 +987,156 @@
         }
       }
       board[d[0]][d[1]] = '-';
+      if (ok) result.push(d);
+    }
+    return result;
+  }
+
+  /*
+   * VCF / VCT 용 패턴 테이블
+   * THREAT_TABLE[색][코드] = [오목자리인지, 둔 뒤의 오목자리 오프셋들, 삼자리인지]
+   *   오목자리인지 : 그 칸에 color 를 두면 그 방향으로 오목이 되는가
+   *   둔 뒤의 오목자리 오프셋들 : 그 칸에 두고 나면 그 방향에서 오목이 되는 빈칸들 (칸 기준 -7~7 오프셋). 1개면 사, 2개면 열린 사
+   *   삼자리인지 : 그 칸에 두면 다음 수에 오목자리가 2개 생기게 할 수 있는가
+   * 표의 값은 countLinePatterns 대신 연속 돌 개수만 세서 계산함
+   *   흑은 연속 5개만, 백은 5개 이상이 오목
+   * fivesThrough, findWinningFours 는 착수점 자신의 코드만 보면 되므로 보드에 잠깐 둘 필요가 없음
+   */
+  const THREAT_TABLE = { b: new Map(), w: new Map() };
+  const LINE_DIR = LINES.map(line => DIRECTIONS.findIndex(([dx, dy]) => dx === line[1][0] - line[0][0] && dy === line[1][1] - line[0][1])); // 줄 번호 -> 방향 번호
+
+  // 문자열 t 의 i 칸에 color 를 두면 오목인가 (연속된 돌 수로 판정)
+  function makesFive(t, i, color) {
+    let n = 1;
+    let j = i - 1;
+    while (j >= 0 && t[j] === color) { n++; j--; }
+    j = i + 1;
+    while (j < t.length && t[j] === color) { n++; j++; }
+    return color === 'b' ? n === 5 : n >= 5;
+  }
+
+  function fiveSpots(t, color) {
+    const r = [];
+    for (let i = 0; i < t.length; i++) if (t[i] === '-' && makesFive(t, i, color)) r.push(i);
+    return r;
+  }
+
+  function threatInfo(code, color) {
+    let e = THREAT_TABLE[color].get(code);
+    if (e === undefined) {
+      const c = pt.RADIUS;
+      const t = pt.windowStr(code, '-');
+      const isFive = makesFive(t, c, color);
+      const after = t.slice(0, c) + color + t.slice(c + 1);
+      const spots = fiveSpots(after, color).map(i => i - c);
+      let isThree = false;
+      if (!spots.length) { // 사가 되는 칸은 삼으로 보지 않음 (vctAttack 에서 어차피 사로 먼저 탐색함)
+        for (let j = 0; j < after.length; j++) {
+          if (after[j] === '-' && fiveSpots(after.slice(0, j) + color + after.slice(j + 1), color).length >= 2) {
+            isThree = true;
+            break;
+          }
+        }
+      }
+      e = [isFive, spots, isThree];
+      THREAT_TABLE[color].set(code, e);
+    }
+    return e;
+  }
+
+  // 보드에 잠깐 두거나 뺄 때 코드도 함께 바꿈 (방어 수를 시험할 때만 사용)
+  function tempPlace(board, pos, color) {
+    board[pos[0]][pos[1]] = color;
+    updateCodesFast(PT_CODES, pos, color);
+  }
+
+  function tempRemove(board, pos, color) {
+    board[pos[0]][pos[1]] = '-';
+    updateCodesFast(PT_CODES, pos, color);
+  }
+
+  // 줄 필터(incLineCounts)를 통과한 줄의 빈칸만 표로 확인. kind 1 : 사자리, 2 : 삼자리
+  function scanBoard(board, color, kind) {
+    const result = new Set();
+    const table = THREAT_TABLE[color];
+    for (let idxLine = 0; idxLine < LINES.length; idxLine++) {
+      const c = incLineCounts[idxLine][color];
+      if (kind === 1 && c[1] + c[2] + c[3] + c[4] === 0) continue; // (사, 삼 없음)
+      if (kind === 2 && c[1] + c[2] + c[3] + c[4] + c[5] + c[6] === 0) continue; // (사, 삼, 이 없음)
+      const d = LINE_DIR[idxLine];
+      for (const [x, y] of LINES[idxLine]) {
+        if (board[x][y] !== '-') continue;
+        const code = PT_CODES[(x * BOARD_SIZE + y) * 4 + d];
+        let e = table.get(code);
+        if (e === undefined) e = threatInfo(code, color);
+        if (kind === 1 ? e[1].length : e[2]) result.add(x * BOARD_SIZE + y);
+      }
+    }
+    return result;
+  }
+
+  function findFourMoves(board, color) {
+    if (!(USE_PT && incActive)) return findFourMovesStr(board, color);
+    return sortedPos(scanBoard(board, color, 1));
+  }
+
+  function findThreeMoves(board, color) {
+    if (!(USE_PT && incActive)) return findThreeMovesStr(board, color);
+    return sortedPos(scanBoard(board, color, 2));
+  }
+
+  // pos 에 color 를 두었다고 보고 (실제로 놓여 있어도 상관 없음) 생기는 오목자리. pos 자신의 코드만 봄
+  function fivesAt(pos, color) {
+    const result = new Set();
+    const table = THREAT_TABLE[color];
+    const [x, y] = pos;
+    const base = (x * BOARD_SIZE + y) * 4;
+    DIRECTIONS.forEach(([dx, dy], d) => {
+      const code = PT_CODES[base + d];
+      let e = table.get(code);
+      if (e === undefined) e = threatInfo(code, color);
+      for (const k of e[1]) result.add((x + dx * k) * BOARD_SIZE + (y + dy * k));
+    });
+    return result;
+  }
+
+  function fivesThrough(board, pos, color) {
+    if (!(USE_PT && incActive)) return fivesThroughStr(board, pos, color);
+    return fivesAt(pos, color);
+  }
+
+  // color 가 지금 두면 이기는 사 (오목 자리 2개 이상 : 열린4, 4-4). 흑은 금수를 제외. 보드에 두지 않고 표만 봄
+  function findWinningFours(gs, color) {
+    if (!(USE_PT && incActive)) return findWinningFoursStr(gs, color);
+    const result = [];
+    for (const m of findFourMoves(gs.board, color)) {
+      if (fivesAt(m, color).size >= 2 && !(color === 'b' && gs.getForbiddenMove(m))) result.push(m);
+    }
+    return result;
+  }
+
+  // 공격 측(att) 의 삼을 막을 수 있는 자리. 이기는 사 자리는 표로 보고, 방어 수만 보드에 잠깐 둠
+  function findThreeDefenses(gs, att) {
+    if (!(USE_PT && incActive)) return findThreeDefensesStr(gs, att);
+    const board = gs.board;
+    const wins = findWinningFours(gs, att);
+    const cand = new Set(wins.map(keyOf));
+    for (const w of wins) { // 열린 사를 만드는 자리 + 그때 생기는 오목 자리 (삼의 양 끝)
+      for (const k of fivesAt(w, att)) cand.add(k);
+    }
+    const defender = att === 'b' ? 'w' : 'b';
+    const result = [];
+    for (const d of sortedPos(cand)) {
+      if (defender === 'b' && gs.getForbiddenMove(d)) continue;
+      tempPlace(board, d, defender);
+      let ok = true;
+      for (const w of wins) {
+        if (!samePos(w, d) && fivesAt(w, att).size >= 2) { // d 를 막은 뒤에도 이기는 사가 남음 -> 방어 실패
+          ok = false;
+          break;
+        }
+      }
+      tempRemove(board, d, defender);
       if (ok) result.push(d);
     }
     return result;
@@ -992,17 +1221,224 @@
     return first ? first : ['(방어 불가)'];
   }
 
-  function findVCT(gs, h, depth = VCT_DEPTH, limit = VCT_NODE_LIMIT) {
+  // 원래 깊이 우선 VCT (이름만 바꿈, 비교용)
+  function findVCTDfs(gs, h, depth = VCT_DEPTH, limit = VCT_NODE_LIMIT) {
     const saved = vcfNodeLimit;
     vcfNodes = 0;
     vcfNodeLimit = limit;
     try {
-      return vctAttack(gs, depth, h);
+      for (let d = 1; d <= depth; d++) { // 깊이를 1부터 늘려가며 탐색 (짧은 수순을 먼저 찾음)
+        const r = vctAttack(gs, d, h);
+        if (r) return r;
+      }
+      return null;
     } catch (e) {
       if (e instanceof ThreatBudget) return null;
       throw e;
     } finally {
       vcfNodeLimit = saved;
+    }
+  }
+
+  /*
+   * 증명수 탐색 (Proof-Number Search, PNS) 으로 VCT 찾기
+   * 깊이 우선 VCT (findVCTDfs) 는 앞쪽 가지에서 노드를 다 써버리면 뒤쪽의 쉬운 수순을 못 봄
+   * PNS 는 탐색 트리를 메모리에 두고, "증명하기 가장 쉬워 보이는 잎" 을 골라 한 칸씩 펼침
+   *   OR 노드 (공격 차례) : 자식 중 하나만 증명되면 증명. pn = 자식 pn 최솟값, dn = 자식 dn 합
+   *   AND 노드 (방어 차례) : 모든 자식이 증명되어야 증명. pn = 자식 pn 합, dn = 자식 dn 최솟값
+   *   pn (proof number) : 증명하려면 더 펼쳐야 할 잎의 최소 개수 (0 이면 공격 승리 확정)
+   *   dn (disproof number) : 반증하려면 더 펼쳐야 할 잎의 최소 개수 (0 이면 이 수순으로는 못 이김)
+   * 새 노드는 바로 평가함 : 방어 자리가 많은 삼은 pn 을 크게 (어려운 공격), 공격 수가 많은 국면은 dn 을 크게
+   * 같은 국면(해시)은 노드 하나를 같이 씀 (사 두 개의 순서만 바꾼 수순 등이 매우 많음)
+   * 공격 수와 방어 수의 규칙은 findVCTDfs 와 같음 (사, 삼 / 삼 막기, 역공 사)
+   */
+  const PNS_INF = 10 ** 9;
+  let PNS_MAX_DEPTH = 12;  // 공격 측 수의 최대 개수 (사 포함). 깊이 우선보다 훨씬 깊게 봐도 됨
+  const PNS_DEPTH_COST = 0; // 새 공격 노드의 pn 에 (공격 수 개수 x 이 값) 을 더함
+  const PNS_USE_TT = true;
+  const PNS_TT = new Map(); // 해시 -> 노드 (한 번의 탐색 안에서만 사용)
+  const NOT_THREAT = {};    // 위협이 아니었던 수 (PNS_TT 에 표시만 해 둠)
+  let pnsNodes = 0;         // 마지막 PNS 에서 만든 노드 수 (측정용)
+  let pnsResult = null;     // 마지막 PNS 결과 : 'win' (수순 있음), 'none' (수순 없음 확인), 'unknown' (노드/시간 초과)
+
+  class PnsNode {
+    constructor(isOr, depth, hash) {
+      this.isOr = isOr;
+      this.depth = depth;    // 지금까지 둔 공격 측 수의 개수
+      this.hash = hash;
+      this.pn = 1;
+      this.dn = 1;
+      this.moves = null;     // 펼칠 때 시험할 수 (평가할 때 미리 구해 둠)
+      this.children = null;  // [[수, 자식 노드]], null 이면 아직 펼치지 않은 잎
+    }
+  }
+
+  // 공격 차례 노드 평가. 보드는 이 노드의 국면
+  function pnsEvalOr(gs, node, att, dfd) {
+    if (findFives(gs.board, att).size) { // 공격 측 오목 완성 가능
+      node.pn = 0; node.dn = PNS_INF;
+      return;
+    }
+    const oppFives = findFives(gs.board, dfd);
+    if (oppFives.size >= 2 || node.depth >= PNS_MAX_DEPTH) { // 상대 오목을 다 못 막음 / 깊이 초과
+      node.pn = PNS_INF; node.dn = 0;
+      return;
+    }
+    let moves;
+    if (oppFives.size) { // 상대 사를 먼저 막아야 함. 막는 수도 위협이어야 공격이 이어짐
+      moves = [minPos(oppFives)];
+    } else {
+      const fours = findFourMoves(gs.board, att);
+      moves = [...fours, ...findThreeMoves(gs.board, att).filter(m => !hasPos(fours, m))];
+    }
+    if (!moves.length) {
+      node.pn = PNS_INF; node.dn = 0;
+      return;
+    }
+    node.moves = moves;
+    node.pn = 1 + node.depth * PNS_DEPTH_COST;
+    node.dn = moves.length;
+  }
+
+  // 공격 측이 m 을 둔 직후 (방어 차례) 평가. 위협이 아니면 false
+  function pnsEvalAnd(gs, node, m, att, dfd) {
+    const fives = fivesThrough(gs.board, m, att);
+    if (fives.size >= 2) { // 열린 사, 사-사
+      node.pn = 0; node.dn = PNS_INF;
+      return true;
+    }
+    if (fives.size) { // 사 : 막는 자리는 하나 (흑이 금수라 못 막으면 펼칠 때 자식이 없어서 증명됨)
+      node.moves = [minPos(fives)];
+      return true;
+    }
+    if (!findWinningFours(gs, att).length) return false; // 사도 아니고 다음 수에 이기는 사도 없음 -> 위협 아님
+    if (findFives(gs.board, dfd).size) { // 방어 측이 바로 이김
+      node.pn = PNS_INF; node.dn = 0;
+      return true;
+    }
+    const defenses = findThreeDefenses(gs, att); // 삼을 막는 자리
+    for (const d of findFourMoves(gs.board, dfd)) { // 역공 사
+      if (!hasPos(defenses, d)) defenses.push(d);
+    }
+    node.moves = defenses;
+    node.pn = Math.max(1, defenses.length);
+    node.dn = 1;
+    return true;
+  }
+
+  // 잎 펼치기 : 자식을 만들고 바로 평가. 보드는 이 노드의 국면
+  function pnsExpand(gs, node, att, dfd) {
+    const children = [];
+    const color = node.isOr ? att : dfd;
+    for (const m of node.moves) {
+      const h = nextHash(node.hash, m, color);
+      const key = hashKey(h);
+      let c = PNS_TT.get(key);
+      if (c !== undefined) { // 다른 수순으로 이미 만든 국면
+        if (c !== NOT_THREAT && (color === 'w' || !gs.getForbiddenMove(m))) children.push([m, c]); // 흑은 이 순서에서 금수일 수 있음
+        continue;
+      }
+      if (!makeMove(gs, m)) continue; // 흑 금수
+      try {
+        if (node.isOr) {
+          c = new PnsNode(false, node.depth + 1, h);
+          if (!pnsEvalAnd(gs, c, m, att, dfd)) c = NOT_THREAT;
+        } else {
+          c = new PnsNode(true, node.depth, h);
+          pnsEvalOr(gs, c, att, dfd);
+        }
+      } finally {
+        unmakeMove(gs);
+      }
+      if (PNS_USE_TT) PNS_TT.set(key, c);
+      if (c !== NOT_THREAT) {
+        children.push([m, c]);
+        pnsNodes++;
+      }
+    }
+    node.children = children;
+    node.moves = null;
+  }
+
+  function pnsUpdate(node) {
+    const ch = node.children;
+    let mn = PNS_INF, sum = 0;
+    if (node.isOr) {
+      for (const [, c] of ch) { mn = Math.min(mn, c.pn); sum += c.dn; }
+      node.pn = mn;
+      node.dn = Math.min(PNS_INF, sum);
+    } else {
+      for (const [, c] of ch) { mn = Math.min(mn, c.dn); sum += c.pn; }
+      node.pn = Math.min(PNS_INF, sum);
+      node.dn = mn;
+    }
+  }
+
+  // 증명된 트리에서 수순을 꺼냄 (공격 : 증명된 자식, 방어 : 대표 응수 하나)
+  function pnsLine(node) {
+    const line = [];
+    while (node.children && node.children.length) {
+      const e = node.children.find(e => e[1].pn === 0);
+      line.push(e[0]);
+      node = e[1];
+    }
+    return line;
+  }
+
+  // 첫 번째 최솟값 (Python 의 min(key=) 과 같음)
+  function firstMin(list, f) {
+    let best = list[0];
+    for (let i = 1; i < list.length; i++) if (f(list[i]) < f(best)) best = list[i];
+    return best;
+  }
+
+  // 지금 차례(공격)의 VCT 를 PNS 로 찾음. limit = 만들 수 있는 최대 노드 수
+  function findVCT(gs, h, depth = PNS_MAX_DEPTH, limit = VCT_NODE_LIMIT) {
+    pnsResult = 'unknown';
+    const att = gs.blackToPlay ? 'b' : 'w';
+    const dfd = gs.blackToPlay ? 'w' : 'b';
+    const savedDepth = PNS_MAX_DEPTH;
+    PNS_MAX_DEPTH = Math.max(depth, PNS_MAX_DEPTH);
+    pnsNodes = 0;
+    PNS_TT.clear();
+    const rootNode = new PnsNode(true, 0, h);
+    const path = [rootNode]; // 루트부터 지금 노드까지 (보드도 이 수순대로 두어져 있음)
+    try {
+      pnsEvalOr(gs, rootNode, att, dfd);
+      if (rootNode.pn === 0) {
+        pnsResult = 'win';
+        return [minPos(findFives(gs.board, att))];
+      }
+      while (rootNode.pn && rootNode.dn) {
+        if (pnsNodes > limit || now() > searchDeadline) return null;
+        // 1. 루트부터 가장 증명하기 쉬운 잎으로 내려감
+        let node = rootNode;
+        while (node.children && node.children.length) { // 펼친 노드 (자식이 없는 노드는 결과가 정해진 잎)
+          const e = node.isOr ? firstMin(node.children, e => e[1].pn) : firstMin(node.children, e => e[1].dn);
+          if (!makeMove(gs, e[0])) { // 혹시 둘 수 없는 수이면 (금수) 지우고 이 노드에서 끝냄
+            node.children.splice(node.children.indexOf(e), 1);
+            node.moves = null;
+            break;
+          }
+          node = e[1];
+          path.push(node);
+        }
+        // 2. 펼치기 (이미 결과가 정해진 잎이면 펼치지 않음 : 다른 수순으로 먼저 결과가 나온 국면)
+        if (node.moves !== null) pnsExpand(gs, node, att, dfd);
+        if (node.children !== null) pnsUpdate(node);
+        // 3. 루트까지 올라가며 값 갱신 (같은 국면을 여러 부모가 같이 쓰므로 끝까지 올라감)
+        while (path.length > 1) {
+          path.pop();
+          unmakeMove(gs);
+          pnsUpdate(path[path.length - 1]);
+        }
+      }
+      pnsResult = rootNode.pn === 0 ? 'win' : 'none';
+      return rootNode.pn === 0 ? pnsLine(rootNode) : null;
+    } finally {
+      for (let i = 0; i < path.length - 1; i++) unmakeMove(gs);
+      PNS_TT.clear();
+      PNS_MAX_DEPTH = savedDepth;
     }
   }
 
@@ -1043,6 +1479,56 @@
     return safe.length ? safe : candidates;
   }
 
+  /*
+   * 최선 수 안전 확인
+   * 탐색으로 고른 수를 두었을 때 상대에게 VCF / VCT 가 생기면 다음 순위 수를 확인함
+   * PNS 는 "수순이 없음" 을 빨리 확인하므로 (대부분 수백 노드) 후보 몇 개는 확인할 수 있음
+   */
+  const VERIFY_MAX = 4;      // 확인할 최대 후보 수
+  const VERIFY_LIMIT = 3000; // 후보 하나의 VCT 노드 제한
+  let rootScores = new Map(); // searchRoot 에서 수마다 받은 점수 (키 : 좌표 정수, 넣은 순서 유지)
+
+  // m 을 둔 뒤 상대 필승 수순 확인. 2 : 없음 확인, 1 : 모름 (노드/시간 초과), 0 : 있음
+  function moveSafety(gs, h, m) {
+    const me = gs.blackToPlay ? 'b' : 'w';
+    if (!makeMove(gs, m)) return 0;
+    try {
+      if (gs.blackWin || gs.whiteWin) return 2;
+      const h1 = nextHash(h, m, me);
+      if (findVCF(gs, h1)) return 0;
+      if (findVCT(gs, h1, PNS_MAX_DEPTH, VERIFY_LIMIT)) return 0;
+      return pnsResult === 'none' ? 2 : 1;
+    } finally {
+      unmakeMove(gs);
+    }
+  }
+
+  // 순서대로 확인해서 "없음 확인" 인 첫 수, 없으면 "모름" 인 첫 수, 그것도 없으면 첫 수. [수, 안전도] 반환
+  function pickSafeMove(gs, h, order, deadline, maxCount = VERIFY_MAX) {
+    searchDeadline = deadline;
+    let unknown = null;
+    for (const m of order.slice(0, maxCount)) {
+      if (now() > deadline) break;
+      const r = moveSafety(gs, h, m);
+      if (r === 2) return [m, 2];
+      if (r === 1 && unknown === null) unknown = m;
+    }
+    return unknown !== null ? [unknown, 1] : [order[0], 0];
+  }
+
+  // 후보를 모두 안전 확인해서 (안전한 수, 모르는 수) 로 나눔. 지는 것이 확인된 수는 버림
+  // 시간이 다 되면 확인하지 못한 수는 "모름" 으로 둠
+  function classifyMoves(gs, h, moves, deadline) {
+    searchDeadline = deadline;
+    const safeList = [], unknownList = [];
+    for (const m of moves) {
+      const r = now() <= deadline ? moveSafety(gs, h, m) : 1;
+      if (r === 2) safeList.push(m);
+      else if (r === 1) unknownList.push(m);
+    }
+    return [safeList, unknownList];
+  }
+
   // 루트탐색: 이전 탐색의 최선 수를 후보수의 가장 앞에 배치함
   function searchRoot(gs, depth, candidates, firstMove, hash) {
     if (hasPos(candidates, firstMove)) {
@@ -1053,6 +1539,7 @@
     const beta = Infinity;
     let bestScore = -Infinity;
     let bestPos = null;
+    rootScores.clear();
     for (const move of candidates) {
       if (!makeMove(gs, move)) continue;
       let score;
@@ -1062,6 +1549,7 @@
         unmakeMove(gs);
       }
       score = -score;
+      rootScores.set(keyOf(move), score); // 수마다 점수 저장 (최선 수가 아니면 상한값)
       if (!bestPos || score > bestScore) {
         bestScore = score;
         bestPos = move;
@@ -1117,6 +1605,21 @@
     let oppSeq = findOppVCF(gs, hash);
     if (oppSeq) {
       candidates = filterByOppVCF(gs, hash, candidates, oppSeq);
+      // 막는 후보를 모두 안전 확인해서 나눔 (안전 / 모름 / 짐)
+      // 안전한 수가 있으면 그 수들만 남기고, 그 중에서 고르는 것은 반복 심화 탐색에 맡김
+      // 안전한 수가 없을 때만 상대 VCF 의 공격 자리 (keyPoints) 를 씀. 이때도 지는 것이 확인된 수는 뺌
+      let safeList = [];
+      if (candidates.length > 1) {
+        let unknownList;
+        [safeList, unknownList] = classifyMoves(gs, hash, candidates, startTime + timeLimit * 1000 * 0.5);
+        if (safeList.length) candidates = safeList;
+        else if (unknownList.length) candidates = unknownList;
+      }
+      if (!safeList.length) {
+        const attacks = oppSeq.filter((_, i) => i % 2 === 0); // 상대 VCF 의 공격 자리
+        const keyPoints = candidates.filter(m => hasPos(attacks, m));
+        if (keyPoints.length) candidates = keyPoints;
+      }
       if (candidates.length === 1) return { pos: candidates[0], reason: 'vcf-defense', seq: oppSeq, score: 0, depth: 0, nodes: nodeCount };
     }
 
@@ -1139,8 +1642,10 @@
     // 기존 반복 심화 탐색 코드
     let bestScore = 0, bestPos = candidates[0], reachedDepth = 0;
     const idStart = now(); // 반복심화 탐색 시작한 시각
+    const idEnd = startTime + timeLimit * 1000 * (1 - VERIFY_TIME_RATIO); // 안전 확인 시간을 남김
+    let lastScores = new Map();
     for (let depth = 1; depth <= maxDepth; depth++) {
-      searchDeadline = depth === 1 ? Infinity : deadline; // 시작시각+제한시간
+      searchDeadline = depth === 1 ? Infinity : idEnd;
       let score, pos;
       try {
         [score, pos] = searchRoot(gs, depth, candidates, bestPos, hash);
@@ -1152,20 +1657,35 @@
         bestScore = score;
         bestPos = pos;
         reachedDepth = depth;
+        lastScores = new Map(rootScores); // 끝까지 마친 깊이의 점수
       }
       // 이기거나 지는 수순 발견 시 더 이상 탐색하지 않음 (리프 VCF 에서 발견한 승리 포함)
       if (Math.abs(bestScore) >= WIN_THRESHOLD) break;
       // 다음 탐색을 시간 내에 못 끝낼 가능성이 매우 높으므로 탐색을 미리 중단함
-      if (now() - idStart > (deadline - idStart) / 2) break;
+      if (now() - idStart > (idEnd - idStart) / 2) break;
+    }
+
+    // 승패가 정해진 경우가 아니면 고른 수가 안전한지 확인
+    let unsafe = null;
+    if (Math.abs(bestScore) < WIN_THRESHOLD) {
+      const others = [...lastScores.keys()].filter(k => k !== keyOf(bestPos));
+      others.sort((a, b) => lastScores.get(b) - lastScores.get(a)); // 안정 정렬 (점수가 같으면 넣은 순서)
+      const order = [bestPos, ...others.map(toPos)];
+      const [safePos] = pickSafeMove(gs, hash, order, deadline);
+      if (!samePos(safePos, bestPos)) { // 고른 수를 두면 상대 필승 수순이 있어서 바꿈
+        unsafe = bestPos;
+        bestPos = safePos;
+      }
     }
 
     const blackScore = gs.blackToPlay ? bestScore : -bestScore;
-    return { pos: bestPos, reason: 'search', defended, score: blackScore, depth: reachedDepth, nodes: nodeCount, ttHits };
+    return { pos: bestPos, reason: 'search', defended, unsafe, score: blackScore, depth: reachedDepth, nodes: nodeCount, ttHits };
   }
 
   // 캐시를 모두 비움 (테스트용)
   function resetCaches() {
-    for (const m of [TT, CANDIDATE_CACHE, LINE_CACHE, VCF_FAIL, VCT_FAIL, FIVE_IDX_CACHE, FOUR_IDX_CACHE, THREE_IDX_CACHE]) m.clear();
+    for (const m of [TT, CANDIDATE_CACHE, LINE_CACHE, VCF_FAIL, VCT_FAIL, FIVE_IDX_CACHE, FOUR_IDX_CACHE, THREE_IDX_CACHE,
+      THREAT_TABLE.b, THREAT_TABLE.w, pt.TABLE.b, pt.TABLE.w]) m.clear();
   }
 
   // 판 상태(board, moveLog, blackToPlay)로 GameState 를 다시 만듦
@@ -1177,18 +1697,29 @@
     return gs;
   }
 
+  // 금수판정: 증분 상태가 켜져 있을 때(탐색 중)는 패턴 테이블로 판정
+  const origForbidden = GameState.prototype.getForbiddenMove; // 원래 금수판정 코드
+  GameState.prototype.getForbiddenMove = function (pos) {
+    if (!incActive) return origForbidden.call(this, pos);
+    return pt.isForbiddenByTable(PT_CODES, pos);
+  };
+  pt.setup(countLinePatterns); // 표 계산에 이 파일의 countLinePatterns 를 사용
+
   root.OmokAI = {
     aiMove, negamax, searchRoot, evaluate, evaluateInc, incInit, getCandidateMoves,
-    countLinePatterns, computeHash, restore, resetCaches, findVCF, findVCT, TIME_LIMIT, MAX_DEPTH,
+    countLinePatterns, computeHash, restore, resetCaches, findVCF, findVCT, findVCTDfs, TIME_LIMIT, MAX_DEPTH,
+    getPnsResult: () => pnsResult,
   };
   if (typeof module !== 'undefined') module.exports = root.OmokAI;
 
   // Web Worker 로 실행된 경우: 판을 받아 계산한 착수점을 돌려줌
   if (typeof WorkerGlobalScope !== 'undefined' && root instanceof WorkerGlobalScope) {
     root.onmessage = (e) => {
-      const { id, state } = e.data;
+      const { id, state, timeLimit } = e.data;
       const t0 = now();
-      const res = aiMove(restore(state));
+      // 1수당 생각 시간 (화면에서 고른 값, 1~10초로 제한)
+      const limit = Math.min(10, Math.max(1, Number(timeLimit) || TIME_LIMIT));
+      const res = aiMove(restore(state), { timeLimit: limit });
       root.postMessage({ id, ...res, ms: now() - t0 });
     };
   }

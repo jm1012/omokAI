@@ -6,11 +6,13 @@ import OmokEngine
 import OmokAI as ai
 import OmokAI_v2 as ai2
 import OmokAI_v3 as ai3
+import OmokAI_v4_pns2 as ai4
 
 WIDTH = HEIGHT = 600
 DIMENSION = 15
 SQ_SIZE = WIDTH//DIMENSION
 IMAGES = {}
+BOT_PLAYS_WHITE = True # 오목 봇 (False : black / True : white)
 
 def loadImages():
     IMAGES['w'] = pg.transform.scale(pg.image.load('images/white_stone_simple.png'), (SQ_SIZE, SQ_SIZE))
@@ -31,8 +33,8 @@ def main():
     running = True
     while running:
         # computer's turn
-        if not gs.blackToPlay and not debugMode:
-            computerMove(gs, ai3)
+        if gs.blackToPlay != BOT_PLAYS_WHITE and not debugMode:
+            computerMove(gs, ai4)
             continue
         # user's turn
         for event in pg.event.get():

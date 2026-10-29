@@ -1,6 +1,6 @@
 /*
  * 화면 그리기와 입력 처리 (Omok.py 의 pygame 부분을 옮긴 파일)
- * 사람은 흑, AI 는 백. AI 계산은 Web Worker 에서 실행
+ * 오목 봇의 색(흑/백)과 1수당 생각 시간(1~10초)을 고를 수 있음. AI 계산은 Web Worker 에서 실행
  */
 (function () {
   const { GameState } = window.OmokEngine;
@@ -20,6 +20,31 @@
   const newBtn = document.getElementById('new-game');
   const copyBtn = document.getElementById('copy-log');
   const forbidToggle = document.getElementById('show-forbidden');
+  const botColorInputs = document.querySelectorAll('input[name="bot-color"]');
+  const thinkTimeInput = document.getElementById('think-time');
+  const thinkTimeOut = document.getElementById('think-time-value');
+  const MAX_THINK_SECONDS = 10; // 1수당 생각 시간 최대값
+
+  // 고른 설정은 이 브라우저에만 기억 (저장이 안 되는 환경이면 기본값 사용)
+  function loadPref(key, fallback) {
+    try {
+      const v = localStorage.getItem('omok-' + key);
+      return v === null ? fallback : v;
+    } catch (e) {
+      return fallback;
+    }
+  }
+  function savePref(key, value) {
+    try { localStorage.setItem('omok-' + key, String(value)); } catch (e) { /* 저장 못 해도 동작에는 문제 없음 */ }
+  }
+  let botColor = loadPref('bot-color', 'w') === 'b' ? 'b' : 'w'; // 오목 봇 색 (Omok.py 의 BOT_PLAYS_WHITE)
+  let thinkSeconds = clampSeconds(Number(loadPref('think-time', 3)));
+  function clampSeconds(v) {
+    return Math.min(MAX_THINK_SECONDS, Math.max(1, Math.round(v) || 3));
+  }
+  const humanColor = () => (botColor === 'b' ? 'w' : 'b');
+  const colorName = (c) => (c === 'b' ? '흑' : '백');
+  const isBotTurn = () => (gs.blackToPlay ? 'b' : 'w') === botColor;
 
   const IMAGES = {};
   for (const [k, src] of [['b', 'images/black_stone_simple.png'], ['w', 'images/white_stone_simple.png'], ['f', 'images/forbidden_mark.png']]) {
@@ -49,23 +74,28 @@
     if (!fallbackLoading) {
       fallbackLoading = new Promise((resolve, reject) => {
         const s = document.createElement('script');
-        s.src = 'ai.js';
-        s.onload = resolve;
-        s.onerror = reject;
-        document.head.appendChild(s);
+        // 패턴 테이블을 먼저 불러온 뒤 AI 를 불러옴
+        const load = (src) => new Promise((ok, fail) => {
+          const s = document.createElement('script');
+          s.src = src;
+          s.onload = ok;
+          s.onerror = fail;
+          document.head.appendChild(s);
+        });
+        load('pattern-table.js').then(() => load('ai.js')).then(resolve, reject);
       });
     }
     return fallbackLoading;
   }
 
-  function askAI(state) {
+  function askAI(state, timeLimit) {
     const id = ++requestId;
     return new Promise((resolve) => {
       const runHere = () => {
         loadFallbackAI().then(() => {
           setTimeout(() => {
             const t0 = performance.now();
-            const res = window.OmokAI.aiMove(window.OmokAI.restore(state));
+            const res = window.OmokAI.aiMove(window.OmokAI.restore(state), { timeLimit });
             resolve({ id, ...res, ms: performance.now() - t0 });
           }, 30);
         });
@@ -83,7 +113,7 @@
         runHere();
       }, { once: true });
       w.addEventListener('message', onMsg);
-      w.postMessage({ id, state });
+      w.postMessage({ id, state, timeLimit });
     });
   }
 
@@ -115,7 +145,8 @@
   function forbiddenPoints() {
     if (forbiddenCache) return forbiddenCache;
     const pts = [];
-    if (gs.blackToPlay && !gs.blackWin && !gs.whiteWin) {
+    // 사람이 흑일 때, 흑 차례에만 표시
+    if (humanColor() === 'b' && gs.blackToPlay && !gs.blackWin && !gs.whiteWin) {
       for (let x = 0; x < DIMENSION; x++)
         for (let y = 0; y < DIMENSION; y++)
           if (gs.board[x][y] === '-' && !gs.isWin([x, y]) && gs.getForbiddenMove([x, y])) pts.push([x, y]);
@@ -234,7 +265,8 @@
     if (hover && !thinking && !isOver() && gs.board[hover[0]][hover[1]] === '-') {
       ctx.globalAlpha = 0.45;
       const cx = margin + hover[0] * step, cy = margin + hover[1] * step;
-      if (IMAGES.b.complete) ctx.drawImage(IMAGES.b, cx - stoneSize / 2, cy - stoneSize / 2, stoneSize, stoneSize);
+      const img = IMAGES[humanColor()];
+      if (img.complete) ctx.drawImage(img, cx - stoneSize / 2, cy - stoneSize / 2, stoneSize, stoneSize);
       ctx.globalAlpha = 1;
     }
   }
@@ -296,9 +328,11 @@
     });
     logEl.scrollTop = logEl.scrollHeight;
 
-    if (gs.blackWin) setStatus('흑 승리! 축하합니다. 새 게임으로 다시 도전해 보세요.', 'win');
-    else if (gs.whiteWin) setStatus('백(AI) 승리. 무르기로 되돌려 보거나 새 게임을 시작하세요.', 'lose');
-    else if (thinking) setStatus('AI가 생각하는 중입니다...', 'thinking');
+    if (isOver()) {
+      const winner = gs.blackWin ? 'b' : 'w';
+      if (winner === humanColor()) setStatus(`${colorName(winner)} 승리! 축하합니다. 새 게임으로 다시 도전해 보세요.`, 'win');
+      else setStatus(`${colorName(winner)}(AI) 승리. 무르기로 되돌려 보거나 새 게임을 시작하세요.`, 'lose');
+    } else if (thinking) setStatus('AI가 생각하는 중입니다...', 'thinking');
     draw();
   }
 
@@ -307,14 +341,14 @@
     refresh();
     const myRequest = requestId + 1;
     const state = { board: gs.board, moveLog: gs.moveLog, blackToPlay: gs.blackToPlay };
-    const res = await askAI(state);
+    const res = await askAI(state, thinkSeconds);
     if (res.id !== myRequest || !thinking) return; // 새 게임/무르기로 취소된 요청
     thinking = false;
     // 반복 심화로 도달한 깊이도 함께 표시 (강제수는 탐색 없이 바로 둠)
     const REASONS = { forced: '강제수', vcf: 'VCF 승리 수순', vct: 'VCT 승리 수순', 'vcf-defense': 'VCF 방어', 'vct-defense': 'VCT 방어' };
-    aiTimeEl.textContent = (res.ms / 1000).toFixed(2) + '초 · ' + (REASONS[res.reason] || `깊이 ${res.depth}`);
+    aiTimeEl.textContent = (res.ms / 1000).toFixed(2) + '초 · ' + (REASONS[res.reason] || `깊이 ${res.depth}`) + (res.unsafe ? ' · 안전 확인으로 수 변경' : '');
     if (res.pos) gs.placeStone(res.pos);
-    if (!isOver()) setStatus('흑 차례입니다. 교차점을 눌러 돌을 놓으세요.');
+    if (!isOver()) setStatus(`${colorName(humanColor())} 차례입니다. 교차점을 눌러 돌을 놓으세요.`);
     refresh();
   }
 
@@ -333,7 +367,7 @@
   }
 
   function playAt(pos) {
-    if (thinking || isOver() || !gs.blackToPlay) return;
+    if (thinking || isOver() || isBotTurn()) return;
     const [x, y] = pos;
     if (gs.board[x][y] !== '-') return;
     if (!gs.placeStone(pos)) {
@@ -348,18 +382,21 @@
     if (gs.moveLog.length === 0) return;
     cancelThinking();
     gs.undoMove();
-    // AI 가 둔 수까지 함께 되돌려 다시 흑 차례로 만듦
-    if (!gs.blackToPlay) gs.undoMove();
-    setStatus('한 수 물렀습니다. 흑 차례입니다.');
+    // AI 가 둔 수까지 함께 되돌려 다시 사람 차례로 만듦
+    if (isBotTurn()) gs.undoMove();
+    setStatus(`한 수 물렀습니다. ${colorName(humanColor())} 차례입니다.`);
     refresh();
+    // 봇이 흑이고 판이 비면 봇이 다시 첫 수를 둠
+    if (isBotTurn() && !isOver()) aiTurn();
   }
 
   function newGame() {
     cancelThinking();
     gs = new GameState();
     aiTimeEl.textContent = '-';
-    setStatus('흑 차례입니다. 교차점을 눌러 첫 수를 두세요.');
+    setStatus(`${colorName(humanColor())}을 잡았습니다. ` + (botColor === 'b' ? 'AI(흑)가 먼저 둡니다.' : '교차점을 눌러 첫 수를 두세요.'));
     refresh();
+    if (isBotTurn()) aiTurn(); // 봇이 흑이면 첫 수를 둠
   }
 
   // ---------- 이벤트 ----------
@@ -375,6 +412,28 @@
   undoBtn.addEventListener('click', undo);
   newBtn.addEventListener('click', newGame);
   forbidToggle.addEventListener('change', draw);
+  // 봇 색을 바꾸면 새 게임으로 시작
+  botColorInputs.forEach((input) => {
+    input.checked = input.value === botColor;
+    input.addEventListener('change', () => {
+      if (!input.checked) return;
+      botColor = input.value;
+      savePref('bot-color', botColor);
+      newGame();
+    });
+  });
+  // 생각 시간은 다음 AI 수부터 적용
+  function showThinkTime() {
+    thinkTimeInput.value = thinkSeconds;
+    thinkTimeOut.textContent = thinkSeconds + '초';
+  }
+  thinkTimeInput.max = MAX_THINK_SECONDS;
+  thinkTimeInput.addEventListener('input', () => {
+    thinkSeconds = clampSeconds(Number(thinkTimeInput.value));
+    savePref('think-time', thinkSeconds);
+    showThinkTime();
+  });
+  showThinkTime();
   copyBtn.addEventListener('click', () => {
     const text = gs.moveLogText();
     const done = () => {
@@ -403,7 +462,6 @@
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', draw);
   new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
-  setStatus('흑 차례입니다. 교차점을 눌러 첫 수를 두세요.');
   resize();
-  refresh();
+  newGame();
 })();
